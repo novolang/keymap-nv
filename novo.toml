@@ -1,0 +1,46 @@
+[package]
+name        = "keymap-nv"
+version     = "0.0.1"
+description = "Keys and mouse reports decoded from the bytes a terminal sends, with no terminal attached: the legacy escape forms, xterm's modifyOtherKeys, the kitty keyboard protocol, three mouse encodings and bracketed paste — and the lone-ESC ambiguity resolved by a flush the CALLER drives, because only the caller knows its read timed out.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and the one interesting consequence is `flush`.  Resolving a
+# lone ESC needs a clock — is another byte coming, or was that the
+# Escape key? — and a `core` package has no clock.  So the decoder does
+# not time anything: it holds the ambiguous bytes, says it is holding
+# them, and resolves when the host, whose read timed out, says to.  The
+# timeout is where it belongs and the decoding is where it belongs.
+layer       = "core"
+
+category    = "terminal"
+
+tags        = ["keyboard", "mouse", "input", "terminal", "crossterm", "kitty-keyboard", "modifyotherkeys", "bracketed-paste", "sans-io"]
+repository  = "https://github.com/novolang/keymap-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Keys and mouse reports, decoded from bytes"
+
+[dependencies]
+# None, and NOT because ansi-nv would have been the wrong layer — it is
+# `core` too and would have passed `dep-layer`.  The input stream is a
+# different state machine from the output one, and three cases say so:
+# X10 mouse (`CSI M Cb Cx Cy`) carries three RAW bytes after the final
+# byte, which a conforming CSI parser has already stopped collecting;
+# the kitty protocol puts its key event in a CSI's sub-parameters,
+# which a decoder has to read as a shape rather than as numbers; and
+# the lone ESC is not ambiguous on output at all.  A decoder that
+# borrowed a CSI scanner would have to special-case its way around all
+# three, and every consumer would pay for an SGR model and a writer it
+# never calls.

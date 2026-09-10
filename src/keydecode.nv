@@ -1,0 +1,280 @@
+// keydecode.nv — bytes in, key and mouse events out, and the one
+// question a decoder cannot answer on its own.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LONE ESC IS THE WHOLE PROBLEM.  A byte 0x1B arrives.  It is
+// either the Escape key, or the first byte of an arrow key, or the
+// first byte of `Alt+x`, and NOTHING IN THE BYTE STREAM DISTINGUISHES
+// THEM.  What distinguishes them is time: if the next byte arrives
+// within a few milliseconds it belongs to a sequence, and if it does
+// not, the user pressed Escape.  Every terminal program in existence
+// resolves this with a timeout, and every one of them puts the timeout
+// somewhere different.
+//
+// A `core` PACKAGE HAS NO CLOCK, and that turns out to be the right
+// constraint rather than an obstacle.  This decoder does not time
+// anything.  It holds the ambiguous bytes, reports `pending`, and
+// resolves them when the HOST — whose read timed out, and which is the
+// only party that could have known — calls `flush`.  The timeout lives
+// where the reading lives; the decoding lives here.  See § The
+// load-bearing interface in the README, because this is that.
+//
+// THE THREE PROTOCOLS THIS COVERS, and the one it refuses:
+//
+//   legacy            the classic forms: C0 bytes, `ESC [ A`,
+//                     `ESC O P`, `ESC [ 1 5 ~`, `ESC [ 1 ; 5 A`.
+//   modifyOtherKeys   xterm's `CSI 27 ; <mods> ; <codepoint> ~`,
+//                     which is how Ctrl+Shift+letter becomes sayable.
+//   kitty keyboard    `CSI <codepoint> ; <mods> : <event> u` and the
+//                     named-key forms, with press, repeat and release.
+//
+//   win32-input-mode  NOT covered.  `protocol_refusal` says why: it is
+//                     six parameters describing a Windows console
+//                     KEY_EVENT_RECORD, including a virtual key code
+//                     and a scan code, and mapping those to this
+//                     model needs a Windows keyboard-layout table that
+//                     is not arithmetic and does not belong in a
+//                     `core` package.
+//
+// WHICH PROTOCOL IS IN USE IS NOT A SETTING HERE.  All three are
+// recognised at once, because their sequences do not collide and a
+// decoder that had to be told would be a decoder that is wrong every
+// time the negotiation is.  What IS a setting is whether the kitty
+// forms are recognised at all, for a program that has to run against a
+// terminal it has not negotiated with.
+
+use keymodel
+use mousedecode
+
+// KeyProtocol names an input protocol, so that a program can ask what
+// this package covers before it asks a terminal to speak it.
+pub enum KeyProtocol
+    KeyLegacyForms
+    KeyModifyOtherKeys
+    KeyKittyKeyboard
+    KeyWin32Input
+
+// protocol_supported says whether this package decodes a protocol.
+pub fn protocol_supported(p: KeyProtocol) -> Bool
+    todo("keymap-nv.keydecode.protocol_supported")
+
+// protocol_refusal is why a protocol is not covered, or `None` when it
+// is.
+//
+// A refusal with a reason rather than an absence, because "does
+// keymap-nv do win32-input-mode" is a question a reader will ask and
+// the answer is more useful than the silence.
+pub fn protocol_refusal(p: KeyProtocol) -> ?Str
+    todo("keymap-nv.keydecode.protocol_refusal")
+
+// KeyLimits is the ceiling on what the decoder will hold.
+//
+// A decoder with no ceiling is one a hostile stream can grow without
+// bound: a bracketed paste that never ends, an escape sequence of a
+// million digits.  Both are bounded here, and both bounds are the
+// caller's.
+pub struct KeyLimits
+    // Bytes of one escape sequence held before the decoder gives up on
+    // it and reports `KeyUnknownSequence`.
+    sequence_bytes_max: Int
+    // Whether the kitty forms are recognised.  A program that has not
+    // negotiated the protocol may still want them off, because a
+    // terminal that never sends them cannot be told apart from one
+    // that does by anything but the negotiation.
+    kitty_enabled: Bool
+
+// KeyDecoder is the input state machine: what it is holding, and how
+// much of it.
+//
+// A value, like ansi-nv's parser and for the same reason — `feed_byte`
+// takes one and returns one, so a caller may keep the decoder an event
+// came out of.
+pub struct KeyDecoder
+    limits: KeyLimits
+    // The bytes of a sequence in progress, or of a paste in progress.
+    // Empty when the decoder is settled.
+    held: [u8]
+    // Whether a bracketed paste is open.  Kept apart from `held`
+    // because a paste's bytes are reported as they arrive rather than
+    // accumulated, so during one the decoder is holding nothing and is
+    // still not settled.
+    in_paste: Bool
+
+// KeyEvent is one thing that happened at the terminal.
+pub enum KeyEvent
+    KeyPressed(stroke: keymodel.KeyStroke)
+    KeyMouse(report: mousedecode.MouseReport)
+    // A bracketed paste is starting.  Everything until `KeyPasteEnd`
+    // is pasted text and not typing, which is the distinction an
+    // editor needs and the reason the mode exists.
+    KeyPasteStart
+    // One byte of pasted text.  A byte at a time rather than a string
+    // at the end, so that a paste of any size costs the decoder
+    // nothing to carry and a program can stream it into a buffer of
+    // its own.
+    KeyPasteByte(byte: Int)
+    KeyPasteEnd
+    // The terminal window gained focus — DEC mode 1004, `CSI I`.
+    KeyFocusGained
+    // …and lost it, `CSI O`.
+    KeyFocusLost
+    // A sequence this package recognised the shape of and not the
+    // meaning: a CSI with a final byte nothing here claims.  Reported
+    // rather than dropped, because a program that knows about a
+    // sequence this package does not — a terminal's own extension, a
+    // query reply it asked for — has to be able to see it.
+    KeyUnknownSequence(final_byte: Int)
+
+// KeyStep is one byte's worth of progress.
+pub struct KeyStep
+    decoder: KeyDecoder
+    // The event the byte completed, if it completed one.  Most bytes
+    // of a sequence complete nothing.
+    event: ?KeyEvent
+
+// KeyDrained is a chunk's or a flush's worth of events, and the
+// decoder left over.
+//
+// `flush` returns a list rather than one event because resolving a
+// held sequence can produce several: `ESC [` that never finished is
+// the Escape key, then `[`.
+pub struct KeyDrained
+    decoder: KeyDecoder
+    events: [KeyEvent]
+
+// How long a host should wait for the byte after a lone ESC before
+// calling `flush`, in milliseconds.
+//
+// A number, not a timer: this package cannot wait and does not try to.
+// 25 is what vim, tmux and crossterm converge on — long enough that a
+// sequence arriving over a slow link is not split, short enough that
+// pressing Escape does not feel stuck.  A host on a high-latency link
+// wants more and should say so.
+pub const ESCAPE_TIMEOUT_MS = 25
+
+// default_limits allows 64 bytes of one sequence and recognises the
+// kitty forms.
+pub fn default_limits() -> KeyLimits
+    todo("keymap-nv.keydecode.default_limits")
+
+// legacy_limits allows 64 bytes of one sequence and does NOT recognise
+// the kitty forms.
+pub fn legacy_limits() -> KeyLimits
+    todo("keymap-nv.keydecode.legacy_limits")
+
+// decoder_new is a settled decoder with `default_limits`.
+pub fn decoder_new() -> KeyDecoder
+    todo("keymap-nv.keydecode.decoder_new")
+
+// decoder_with is a settled decoder with the limits given.
+pub fn decoder_with(limits: KeyLimits) -> KeyDecoder
+    todo("keymap-nv.keydecode.decoder_with")
+
+// feed_byte advances the decoder by one byte.
+//
+// The entry point everything else is written over.  Most bytes of a
+// sequence complete nothing and come back with `event: None`; the byte
+// that finishes one comes back with the event.
+//
+// A lone ESC is NEVER reported as the Escape key here, however long
+// ago it arrived — this function has no idea how long ago that was.
+// It leaves the decoder pending, and `flush` is what resolves it.
+//
+// ```novo
+// use keydecode
+//
+// fn main() [io]
+//     let d = keydecode.decoder_new()
+//     let step = keydecode.feed_byte(d, 0x1B)
+//     match step.event
+//         None    => println("held — could be Escape, could be an arrow")
+//         Some(_) => println("an event, which a lone ESC never is")
+// ```
+pub fn feed_byte(d: KeyDecoder, b: Int) -> KeyStep
+    todo("keymap-nv.keydecode.feed_byte")
+
+// feed advances the decoder over a whole chunk.
+//
+// The convenience over `feed_byte`, and the one most hosts will use:
+// a read gives a chunk, the chunk gives events, and whatever is left
+// over stays held for the next read — or for the `flush` after the
+// read that times out.
+pub fn feed(d: KeyDecoder, chunk: [u8]) -> KeyDrained
+    todo("keymap-nv.keydecode.feed")
+
+// flush resolves whatever the decoder is holding, on the caller's word
+// that no more bytes are coming.
+//
+// THIS IS THE LOAD-BEARING FUNCTION OF THE PACKAGE.  A host reads with
+// a timeout; when the read times out and the decoder is pending, it
+// calls this, and the held bytes become events: a lone ESC becomes the
+// Escape key, an `ESC [` that never finished becomes Escape and then
+// `[`, a half-arrived kitty sequence becomes an unknown one.
+//
+// Calling it when the decoder is settled produces no events and is
+// harmless, so a host may call it after every timed-out read without
+// checking.
+//
+// ```novo
+// use keydecode
+//
+// fn main() [io]
+//     var d = keydecode.decoder_new()
+//     let step = keydecode.feed_byte(d, 0x1B)
+//     d = step.decoder
+//     // …the host's read times out here, and only the host knows it.
+//     let drained = keydecode.flush(d)
+//     match list.get(drained.events, 0)
+//         KeyPressed(_) => println("Escape, resolved by the caller's clock")
+//         _             => println("something else")
+// ```
+pub fn flush(d: KeyDecoder) -> KeyDrained
+    todo("keymap-nv.keydecode.flush")
+
+// is_pending says whether the decoder is holding bytes it cannot
+// resolve without either another byte or a `flush`.
+//
+// What a host's read loop switches on: pending means "read with the
+// escape timeout", settled means "block".  A host that always used a
+// timeout would spin; one that always blocked would leave the Escape
+// key stuck until the next keystroke, which is the bug every terminal
+// program has shipped at least once.
+pub fn is_pending(d: KeyDecoder) -> Bool
+    todo("keymap-nv.keydecode.is_pending")
+
+// pending_bytes is how many bytes the decoder is holding.
+//
+// For a host that logs, and for a test that wants to assert a chunk
+// boundary left exactly what it should have.
+pub fn pending_bytes(d: KeyDecoder) -> Int
+    todo("keymap-nv.keydecode.pending_bytes")
+
+// in_paste says whether a bracketed paste is open.
+//
+// Not the same question as `is_pending`: during a paste the decoder is
+// holding nothing — every byte is reported as it arrives — and is
+// still not settled, because the paste has to end before anything
+// after it can be read as typing.
+pub fn in_paste(d: KeyDecoder) -> Bool
+    todo("keymap-nv.keydecode.in_paste")
+
+// reset drops whatever the decoder is holding and closes any open
+// paste.
+//
+// What a program calls when it has taken the terminal back from a
+// child, or after an error where the held bytes are known to be
+// stale.
+pub fn reset(d: KeyDecoder) -> KeyDecoder
+    todo("keymap-nv.keydecode.reset")
+
+// decode_one is the whole decoder over a complete sequence, for a
+// caller that already has one.
+//
+// `None` when the bytes are not a complete sequence — a prefix, or
+// nothing this package recognises.  It exists for the two callers that
+// are not read loops: a test with a fixture, and a program with a key
+// binding written as the bytes a terminal sends, which is how a
+// configuration file spells one.
+pub fn decode_one(sequence: [u8], limits: KeyLimits) -> ?KeyEvent
+    todo("keymap-nv.keydecode.decode_one")

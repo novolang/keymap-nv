@@ -1,0 +1,402 @@
+// keydecode_tests.nv — the API suite for the input state machine.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: keymap-nv.<module>.<fn>`.
+// Run with `--isolate` for one verdict per `@test`.
+//
+// THE CASES THAT MATTER are the ones about the lone ESC, and they are
+// written as three separate tests on purpose: that `feed_byte` never
+// resolves it, that another byte resolves it one way, and that `flush`
+// resolves it the other.  A decoder that got any one of the three
+// wrong would still pass a suite that only fed complete sequences —
+// which is how the bug ships.
+//
+// The row on every `@test` here is `[io]`, for `test.case` and nothing
+// else.  A decoder that had needed a clock would have forced `[time]`
+// onto this file, and that is the check.
+
+use std.test
+use std.list
+use keymodel
+use mousedecode
+use keydecode
+
+// Feed a whole list of bytes and hand back the decoder and every event
+// that came out, which is the shape most cases here want.
+fn run(bytes: [Int]) -> keydecode.KeyDrained
+    drain_with(keydecode.decoder_new(), bytes)
+
+// The same walk over a decoder the caller configured, which the case
+// about the kitty forms being off needs.
+fn drain_with(start: keydecode.KeyDecoder, bytes: [Int]) -> keydecode.KeyDrained
+    keydecode.feed(start, list.map(bytes, b => b as u8))
+
+@test
+fn test_a_fresh_decoder_is_settled() [io]
+    let d = keydecode.decoder_new()
+
+    test.case("a new decoder holds nothing")
+    test.assert(keydecode.is_pending(d) == false)
+    test.assert(keydecode.pending_bytes(d) == 0)
+
+    test.case("and is not in a paste")
+    test.assert(keydecode.in_paste(d) == false)
+
+@test
+fn test_a_plain_byte_is_a_character_key() [io]
+    let out = run([0x71])
+
+    test.case("'q' comes out as one event")
+    test.assert(list.len(out.events) == 1)
+
+    test.case("and it is the character, unmodified")
+    match list.get(out.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyChar(c) => test.assert(c == 0x71)
+                _          => test.assert(false)
+            test.assert(keymodel.mods_any(k.mods) == false)
+        _             => test.assert(false)
+
+@test
+fn test_a_control_byte_is_the_letter_with_ctrl_held() [io]
+    // 0x03 is Ctrl+C.  A program that matched on 0x03 would be
+    // matching on the encoding rather than on the key.
+    let out = run([0x03])
+
+    test.case("the letter, not the control byte")
+    match list.get(out.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyChar(c) => test.assert(c == 0x63)
+                _          => test.assert(false)
+            test.assert(k.mods.ctrl)
+        _             => test.assert(false)
+
+@test
+fn test_tab_and_enter_are_keys_rather_than_control_letters() [io]
+    // 0x09 is both Tab and Ctrl+I, and 0x0D is both Enter and Ctrl+M.
+    // A decoder that applied the control rule blindly reports Tab as
+    // Ctrl+I forever.
+    test.case("0x09 is Tab")
+    match list.get(run([0x09]).events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyNamed(KeyTab) => test.assert(true)
+                _                => test.assert(false)
+        _             => test.assert(false)
+
+    test.case("0x0D is Enter")
+    match list.get(run([0x0D]).events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyNamed(KeyEnter) => test.assert(true)
+                _                  => test.assert(false)
+        _             => test.assert(false)
+
+    test.case("and the mapping says so, both directions")
+    match keymodel.char_of_control(0x09)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+    match keymodel.char_of_control(0x03)
+        Some(c) => test.assert(c == 0x63)
+        None    => test.assert(false)
+
+@test
+fn test_a_lone_esc_is_never_resolved_by_feeding() [io]
+    let d = keydecode.decoder_new()
+    let step = keydecode.feed_byte(d, 0x1B)
+
+    test.case("no event comes out of the ESC itself")
+    match step.event
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and the decoder says it is holding something")
+    test.assert(keydecode.is_pending(step.decoder))
+    test.assert(keydecode.pending_bytes(step.decoder) == 1)
+
+@test
+fn test_a_following_byte_resolves_the_esc_into_a_sequence() [io]
+    // `ESC [ A` — the up arrow.
+    let out = run([0x1B, 0x5B, 0x41])
+
+    test.case("one event, and it is the arrow")
+    test.assert(list.len(out.events) == 1)
+    match list.get(out.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyNamed(KeyUp) => test.assert(true)
+                _               => test.assert(false)
+        _             => test.assert(false)
+
+    test.case("and the decoder is settled again")
+    test.assert(keydecode.is_pending(out.decoder) == false)
+
+@test
+fn test_a_flush_resolves_the_esc_into_the_escape_key() [io]
+    // The load-bearing case: the host's read timed out, and only the
+    // host could have known that.
+    var d = keydecode.decoder_new()
+    let step = keydecode.feed_byte(d, 0x1B)
+    d = step.decoder
+
+    let drained = keydecode.flush(d)
+
+    test.case("the flush produces the Escape key")
+    test.assert(list.len(drained.events) == 1)
+    match list.get(drained.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyNamed(KeyEscape) => test.assert(true)
+                _                   => test.assert(false)
+        _             => test.assert(false)
+
+    test.case("and leaves the decoder settled")
+    test.assert(keydecode.is_pending(drained.decoder) == false)
+
+@test
+fn test_a_flush_of_a_half_sequence_gives_back_every_byte() [io]
+    // `ESC [` that never finished is Escape, then the character `[`.
+    // Two events, which is why `flush` returns a list.
+    var d = keydecode.decoder_new()
+    for b in [0x1B, 0x5B]
+        let step = keydecode.feed_byte(d, b)
+        d = step.decoder
+
+    let drained = keydecode.flush(d)
+
+    test.case("both bytes come back as events")
+    test.assert(list.len(drained.events) == 2)
+
+    test.case("Escape first")
+    match list.get(drained.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyNamed(KeyEscape) => test.assert(true)
+                _                   => test.assert(false)
+        _             => test.assert(false)
+
+    test.case("then the bracket as a character")
+    match list.get(drained.events, 1)
+        KeyPressed(k) =>
+            match k.press
+                KeyChar(c) => test.assert(c == 0x5B)
+                _          => test.assert(false)
+        _             => test.assert(false)
+
+@test
+fn test_a_flush_on_a_settled_decoder_is_harmless() [io]
+    // So that a host may call it after every timed-out read without
+    // first asking whether it needs to.
+    let drained = keydecode.flush(keydecode.decoder_new())
+
+    test.case("nothing comes out")
+    test.assert(list.len(drained.events) == 0)
+
+    test.case("and the decoder is unchanged")
+    test.assert(keydecode.is_pending(drained.decoder) == false)
+
+@test
+fn test_alt_is_esc_and_then_the_key() [io]
+    // `ESC x` is Alt+x, which is the same two bytes as Escape followed
+    // by x — and the only thing that ever told them apart is the gap.
+    let out = run([0x1B, 0x78])
+
+    test.case("fed together, it is Alt+x")
+    test.assert(list.len(out.events) == 1)
+    match list.get(out.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyChar(c) => test.assert(c == 0x78)
+                _          => test.assert(false)
+            test.assert(k.mods.alt)
+        _             => test.assert(false)
+
+@test
+fn test_a_modifier_parameter_is_one_more_than_the_bitmask() [io]
+    // `CSI 1 ; 5 A` — Ctrl+Up.  A decoder that read 5 as the bitmask
+    // reports shift and alt instead.
+    test.case("a modifier parameter of 1 means nothing held")
+    test.assert(keymodel.mods_any(keymodel.mods_of(1)) == false)
+
+    test.case("5 is ctrl")
+    let m = keymodel.mods_of(5)
+    test.assert(m.ctrl)
+    test.assert(m.shift == false)
+    test.assert(m.alt == false)
+
+    test.case("and the inverse agrees")
+    test.assert(keymodel.mods_param(keymodel.mods_of(5)) == 5)
+    test.assert(keymodel.mods_param(keymodel.no_mods()) == 1)
+
+@test
+fn test_the_modified_arrow_carries_its_modifier() [io]
+    let out = run([0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41])
+
+    test.case("Ctrl+Up is one event")
+    test.assert(list.len(out.events) == 1)
+    match list.get(out.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyNamed(KeyUp) => test.assert(true)
+                _               => test.assert(false)
+            test.assert(k.mods.ctrl)
+        _             => test.assert(false)
+
+@test
+fn test_modify_other_keys_says_what_the_legacy_forms_cannot() [io]
+    // `CSI 27 ; 6 ; 99 ~` — Ctrl+Shift+c, which has no legacy
+    // spelling at all because Ctrl+c and Ctrl+Shift+c are both 0x03.
+    let out = run([0x1B, 0x5B, 0x32, 0x37, 0x3B, 0x36, 0x3B, 0x39, 0x39, 0x7E])
+
+    test.case("the codepoint is the letter")
+    match list.get(out.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyChar(c) => test.assert(c == 0x63)
+                _          => test.assert(false)
+            test.case("with both modifiers, which the legacy byte could not say")
+            test.assert(k.mods.ctrl)
+            test.assert(k.mods.shift)
+        _             => test.assert(false)
+
+@test
+fn test_the_kitty_protocol_reports_a_release() [io]
+    // `CSI 99 ; 1 : 3 u` — the letter c, released.
+    let out = run([0x1B, 0x5B, 0x39, 0x39, 0x3B, 0x31, 0x3A, 0x33, 0x75])
+
+    test.case("a release is an event of its own")
+    match list.get(out.events, 0)
+        KeyPressed(k) =>
+            match k.motion
+                KeyUpEvent => test.assert(true)
+                _          => test.assert(false)
+        _             => test.assert(false)
+
+@test
+fn test_the_kitty_forms_can_be_turned_off() [io]
+    let out = drain_with(keydecode.decoder_with(keydecode.legacy_limits()),
+                         [0x1B, 0x5B, 0x39, 0x39, 0x3B, 0x31, 0x3A, 0x33, 0x75])
+
+    test.case("with the kitty forms off, the sequence is unrecognised rather than guessed")
+    match list.get(out.events, 0)
+        KeyUnknownSequence(f) => test.assert(f == 0x75)
+        _                     => test.assert(false)
+
+@test
+fn test_a_bracketed_paste_streams_its_bytes() [io]
+    // `CSI 200 ~` A `CSI 201 ~`
+    let out = run([0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E,
+                   0x41,
+                   0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E])
+
+    test.case("start, one byte, end")
+    test.assert(list.len(out.events) == 3)
+    match list.get(out.events, 0)
+        KeyPasteStart => test.assert(true)
+        _             => test.assert(false)
+    match list.get(out.events, 1)
+        KeyPasteByte(b) => test.assert(b == 0x41)
+        _               => test.assert(false)
+    match list.get(out.events, 2)
+        KeyPasteEnd => test.assert(true)
+        _           => test.assert(false)
+
+    test.case("and the paste is closed afterwards")
+    test.assert(keydecode.in_paste(out.decoder) == false)
+
+@test
+fn test_an_open_paste_is_not_settled_but_holds_nothing() [io]
+    var d = keydecode.decoder_new()
+    for b in [0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E]
+        let step = keydecode.feed_byte(d, b)
+        d = step.decoder
+
+    test.case("the paste is open")
+    test.assert(keydecode.in_paste(d))
+
+    test.case("and no bytes are being held, because they are reported as they arrive")
+    test.assert(keydecode.pending_bytes(d) == 0)
+
+@test
+fn test_focus_events_are_their_own_two_sequences() [io]
+    test.case("CSI I is focus gained")
+    match list.get(run([0x1B, 0x5B, 0x49]).events, 0)
+        KeyFocusGained => test.assert(true)
+        _              => test.assert(false)
+
+    test.case("and CSI O is focus lost")
+    match list.get(run([0x1B, 0x5B, 0x4F]).events, 0)
+        KeyFocusLost => test.assert(true)
+        _            => test.assert(false)
+
+@test
+fn test_an_sgr_mouse_report_comes_through_the_same_stream() [io]
+    // `CSI < 0 ; 40 ; 12 M` — left button pressed at column 40, row 12.
+    let out = run([0x1B, 0x5B, 0x3C, 0x30, 0x3B, 0x34, 0x30, 0x3B,
+                   0x31, 0x32, 0x4D])
+
+    test.case("a mouse report is an event like any other")
+    match list.get(out.events, 0)
+        KeyMouse(r) =>
+            test.assert(r.col == 40)
+            test.assert(r.row == 12)
+            test.assert(mousedecode.is_wheel(r) == false)
+            match r.action
+                MousePressed => test.assert(true)
+                _            => test.assert(false)
+        _           => test.assert(false)
+
+@test
+fn test_an_x10_mouse_report_carries_three_raw_bytes() [io]
+    // `CSI M <32> <72> <44>` — the case an ordinary CSI parser cannot
+    // read, because a coordinate of 59 is the byte `;`.
+    let out = run([0x1B, 0x5B, 0x4D, 0x20, 0x48, 0x2C])
+
+    test.case("the raw bytes decode to one-based coordinates")
+    match list.get(out.events, 0)
+        KeyMouse(r) =>
+            test.assert(r.col == 40)
+            test.assert(r.row == 12)
+        _           => test.assert(false)
+
+@test
+fn test_an_unrecognised_sequence_is_reported_rather_than_dropped() [io]
+    // `CSI 1 2 3 Z` — a final byte nothing here claims.  A program
+    // that knows about it has to be able to see it.
+    let out = run([0x1B, 0x5B, 0x31, 0x32, 0x33, 0x5A])
+
+    test.case("the final byte comes back")
+    match list.get(out.events, 0)
+        KeyUnknownSequence(f) => test.assert(f == 0x5A)
+        _                     => test.assert(false)
+
+@test
+fn test_a_chunk_boundary_anywhere_changes_nothing() [io]
+    // The same six bytes of Ctrl+Up, split after the third.
+    var d = keydecode.decoder_new()
+    let first = keydecode.feed(d, [0x1B as u8, 0x5B as u8, 0x31 as u8])
+
+    test.case("half a sequence produces nothing and stays pending")
+    test.assert(list.len(first.events) == 0)
+    test.assert(keydecode.is_pending(first.decoder))
+
+    let second = keydecode.feed(first.decoder, [0x3B as u8, 0x35 as u8, 0x41 as u8])
+
+    test.case("and the other half completes it")
+    test.assert(list.len(second.events) == 1)
+    test.assert(keydecode.is_pending(second.decoder) == false)
+
+@test
+fn test_reset_drops_what_the_decoder_is_holding() [io]
+    var d = keydecode.decoder_new()
+    for b in [0x1B, 0x5B]
+        let step = keydecode.feed_byte(d, b)
+        d = step.decoder
+
+    test.case("mid-sequence, the decoder is pending")
+    test.assert(keydecode.is_pending(d))
+
+    test.case("and a reset settles it with nothing reported")
+    test.assert(keydecode.is_pending(keydecode.reset(d)) == false)

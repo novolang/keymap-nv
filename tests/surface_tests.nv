@@ -1,0 +1,262 @@
+// surface_tests.nv — the rest of the published surface, called once
+// each.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: keymap-nv.<module>.<fn>`.
+// Run with `--isolate` for one verdict per `@test`.
+//
+// WHY THIS FILE EXISTS SEPARATELY.  `keydecode_tests.nv` asserts
+// BEHAVIOUR — that a lone ESC stays held, that a flush resolves it.
+// This one asserts that the surface is callable at all: that every
+// published signature type-checks from outside its own module, with
+// the argument types a consumer would pass.  On an interface package
+// that is the product, so it is worth a suite of its own.
+
+use std.test
+use std.list
+use keymodel
+use mousedecode
+use keydecode
+
+@test
+fn test_the_three_keystroke_constructors_agree_with_the_model() [io]
+    test.case("a character key has no modifiers")
+    let q = keymodel.char_key(0x71)
+    test.assert(keymodel.mods_any(q.mods) == false)
+
+    test.case("a control key has ctrl and the letter")
+    let c = keymodel.ctrl_key(0x63)
+    test.assert(c.mods.ctrl)
+
+    test.case("a named key is the name")
+    let home = keymodel.named_key(KeyHome)
+    match home.press
+        KeyNamed(KeyHome) => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("and equal keystrokes compare equal")
+    test.assert(keymodel.stroke_eq(q, keymodel.char_key(0x71)))
+    test.assert(keymodel.stroke_eq(q, c) == false)
+
+@test
+fn test_modifiers_can_be_replaced_and_compared() [io]
+    let plain = keymodel.no_mods()
+    let ctrl = keymodel.mods_of(5)
+
+    test.case("two modifier sets compare")
+    test.assert(keymodel.mods_eq(plain, plain))
+    test.assert(keymodel.mods_eq(plain, ctrl) == false)
+
+    test.case("and a keystroke takes a new set")
+    let k = keymodel.with_mods(keymodel.char_key(0x71), ctrl)
+    test.assert(k.mods.ctrl)
+
+@test
+fn test_the_control_byte_mapping_runs_both_ways() [io]
+    test.case("a letter has a control byte")
+    match keymodel.control_char(0x63)
+        Some(b) => test.assert(b == 0x03)
+        None    => test.assert(false)
+
+    test.case("and a digit does not")
+    match keymodel.control_char(0x31)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_function_key_carries_its_number() [io]
+    test.case("F5 is a named key with a number in it")
+    let f5 = keymodel.named_key(KeyFunction(5))
+    match f5.press
+        KeyNamed(KeyFunction(n)) => test.assert(n == 5)
+        _                        => test.assert(false)
+
+@test
+fn test_the_keypad_keys_are_their_own_press() [io]
+    test.case("a keypad digit is not the digit above the letters")
+    let pad = KeyStroke { press: KeyPad(KeyPadDigit(5)),
+                          mods: keymodel.no_mods(),
+                          motion: KeyDownEvent }
+    test.assert(keymodel.stroke_eq(pad, keymodel.char_key(0x35)) == false)
+
+    test.case("and keypad 5 with NumLock off has a name of its own")
+    let begin = KeyStroke { press: KeyPad(KeyPadBegin),
+                            mods: keymodel.no_mods(),
+                            motion: KeyDownEvent }
+    test.assert(keymodel.stroke_eq(begin, pad) == false)
+
+@test
+fn test_the_button_byte_splits_into_button_modifiers_and_motion() [io]
+    test.case("button 0 with no modifiers is the left button")
+    match mousedecode.decode_button(0)
+        MouseLeft => test.assert(true)
+        _         => test.assert(false)
+    test.assert(keymodel.mods_any(mousedecode.decode_mods(0)) == false)
+    test.assert(mousedecode.is_motion(0) == false)
+
+    test.case("bit 5 is motion")
+    test.assert(mousedecode.is_motion(32))
+
+    test.case("bit 6 puts the low bits into the wheel's meaning")
+    match mousedecode.decode_button(64)
+        MouseWheelUp => test.assert(true)
+        _            => test.assert(false)
+    match mousedecode.decode_button(65)
+        MouseWheelDown => test.assert(true)
+        _              => test.assert(false)
+
+    test.case("and bit 7 puts them into buttons 8..11")
+    match mousedecode.decode_button(128)
+        MouseExtraButton(n) => test.assert(n == 8)
+        _                   => test.assert(false)
+
+@test
+fn test_the_button_byte_can_be_written_as_well_as_read() [io]
+    test.case("the round trip holds for a plain press")
+    let code = mousedecode.button_code(MouseLeft, keymodel.no_mods(), false)
+    match mousedecode.decode_button(code)
+        MouseLeft => test.assert(true)
+        _         => test.assert(false)
+
+    test.case("and for a wheel turn with ctrl held, which is a zoom in most programs")
+    let wheel = mousedecode.button_code(MouseWheelUp, keymodel.mods_of(5), false)
+    test.assert(mousedecode.decode_mods(wheel).ctrl)
+
+@test
+fn test_all_three_encodings_produce_the_same_value() [io]
+    test.case("X10's three raw bytes")
+    match mousedecode.report_x10(0x20, 0x48, 0x2C)
+        Some(r) =>
+            test.assert(r.col == 40)
+            test.assert(r.row == 12)
+        None    => test.assert(false)
+
+    test.case("SGR's three parameters and its final byte")
+    match mousedecode.report_sgr(0, 40, 12, 0x4D)
+        Some(r) =>
+            test.assert(r.col == 40)
+            test.assert(r.row == 12)
+        None    => test.assert(false)
+
+    test.case("and urxvt's, whose first parameter carries X10's offset")
+    match mousedecode.report_urxvt(32, 40, 12)
+        Some(r) =>
+            test.assert(r.col == 40)
+            test.assert(r.row == 12)
+        None    => test.assert(false)
+
+@test
+fn test_only_the_sgr_encoding_knows_which_button_was_released() [io]
+    test.case("SGR's lower-case final byte is a release of a named button")
+    match mousedecode.report_sgr(0, 40, 12, 0x6D)
+        Some(r) =>
+            match r.action
+                MouseReleased => test.assert(true)
+                _             => test.assert(false)
+            match r.button
+                MouseLeft => test.assert(true)
+                _         => test.assert(false)
+        None    => test.assert(false)
+
+    test.case("while X10's button 3 says a button was let go and not which")
+    match mousedecode.report_x10(0x23, 0x48, 0x2C)
+        Some(r) =>
+            match r.action
+                MouseReleased => test.assert(true)
+                _             => test.assert(false)
+            match r.button
+                MouseNoButton => test.assert(true)
+                _             => test.assert(false)
+        None    => test.assert(false)
+
+@test
+fn test_a_wheel_turn_answers_the_question_a_program_asks() [io]
+    match mousedecode.report_sgr(64, 10, 10, 0x4D)
+        Some(r) =>
+            test.case("a wheel turn says so by name")
+            test.assert(mousedecode.is_wheel(r))
+        None    => test.assert(false)
+
+    match mousedecode.report_sgr(0, 10, 10, 0x4D)
+        Some(r) =>
+            test.case("and a button press does not")
+            test.assert(mousedecode.is_wheel(r) == false)
+        None    => test.assert(false)
+
+@test
+fn test_the_x10_ceiling_is_a_question_a_program_can_ask() [io]
+    test.case("a coordinate below the ceiling is exact")
+    match mousedecode.report_x10(0x20, 0x48, 0x2C)
+        Some(r) => test.assert(mousedecode.coordinates_are_exact(r))
+        None    => test.assert(false)
+
+    test.case("a clamped one is not, and the value would be a lie")
+    match mousedecode.report_x10(0x20, 0xFF, 0x2C)
+        Some(r) =>
+            test.assert(r.col == mousedecode.X10_COORD_MAX)
+            test.assert(mousedecode.coordinates_are_exact(r) == false)
+        None    => test.assert(false)
+
+    test.case("while SGR has no ceiling to hit")
+    match mousedecode.report_sgr(0, 400, 12, 0x4D)
+        Some(r) => test.assert(mousedecode.coordinates_are_exact(r))
+        None    => test.assert(false)
+
+@test
+fn test_the_package_says_which_protocols_it_covers() [io]
+    test.case("three are covered")
+    test.assert(keydecode.protocol_supported(KeyLegacyForms))
+    test.assert(keydecode.protocol_supported(KeyModifyOtherKeys))
+    test.assert(keydecode.protocol_supported(KeyKittyKeyboard))
+
+    test.case("and one is refused with a reason rather than a silence")
+    test.assert(keydecode.protocol_supported(KeyWin32Input) == false)
+    match keydecode.protocol_refusal(KeyWin32Input)
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+    test.case("a covered protocol has no refusal")
+    match keydecode.protocol_refusal(KeyLegacyForms)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_the_two_limit_sets_differ_in_the_one_setting() [io]
+    let full = keydecode.default_limits()
+    let legacy = keydecode.legacy_limits()
+
+    test.case("the default recognises the kitty forms")
+    test.assert(full.kitty_enabled)
+
+    test.case("and the legacy set does not")
+    test.assert(legacy.kitty_enabled == false)
+
+    test.case("while both bound one sequence the same way")
+    test.assert(full.sequence_bytes_max == legacy.sequence_bytes_max)
+
+@test
+fn test_a_complete_sequence_decodes_on_its_own() [io]
+    // The entry point for a test with a fixture, and for a key binding
+    // written in a configuration file as the bytes a terminal sends.
+    test.case("a whole sequence gives an event")
+    match keydecode.decode_one([0x1B as u8, 0x5B as u8, 0x41 as u8],
+                               keydecode.default_limits())
+        Some(KeyPressed(k)) =>
+            match k.press
+                KeyNamed(KeyUp) => test.assert(true)
+                _               => test.assert(false)
+        _                   => test.assert(false)
+
+    test.case("and a prefix gives nothing rather than a guess")
+    match keydecode.decode_one([0x1B as u8, 0x5B as u8], keydecode.default_limits())
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_the_escape_timeout_is_advice_and_not_a_timer() [io]
+    test.case("the package publishes a number a host can use")
+    test.assert(keydecode.ESCAPE_TIMEOUT_MS == 25)
+
+    test.case("and nothing in the package consults it, which is why flush exists")
+    let drained = keydecode.flush(keydecode.decoder_with(keydecode.default_limits()))
+    test.assert(list.len(drained.events) == 0)
