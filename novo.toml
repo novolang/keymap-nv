@@ -1,6 +1,6 @@
 [package]
 name        = "keymap-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Keys and mouse reports decoded from the bytes a terminal sends, with no terminal attached: the legacy escape forms, xterm's modifyOtherKeys, the kitty keyboard protocol, three mouse encodings and bracketed paste — and the lone-ESC ambiguity resolved by a flush the CALLER drives, because only the caller knows its read timed out.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
