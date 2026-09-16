@@ -298,8 +298,10 @@ and fail at run, each on the `not implemented: keymap-nv.<module>.<fn>`
 panic that is its body. That is the expected state of an interface
 release. They turn green one at a time as bodies land.
 
-`tests/embedded_probe.nv` is the device claim as a program that either
-builds or does not. See "Running on a microcontroller".
+`tests/embedded_probe.nv` is the program that shows this package builds
+for a microcontroller with no heap allocator. It is compiled for the
+nRF52 target and either builds or does not. See "Running on a
+microcontroller".
 
 ## Implementation status
 
