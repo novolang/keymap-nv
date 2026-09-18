@@ -1,49 +1,45 @@
-// keymodel.nv — what a keystroke IS, before any question of how it
+// keymodel.nv — what a keystroke is, before any question of how it
 // arrived.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A terminal does not send keys.  It sends bytes, and the same
+// keystroke has three or four spellings depending on which protocol the
+// terminal negotiated.  Ctrl and `c` is the byte 0x03 in the legacy
+// world, `CSI 27 ; 5 ; 99 ~` under xterm's modifyOtherKeys, and
+// `CSI 99 ; 5 u` under the kitty keyboard protocol.  This module is the
+// value all three decode to, so a program's key handling is written
+// once and the protocol stays a detail of the decoder.
 //
-// A TERMINAL DOES NOT SEND KEYS.  It sends bytes, and the same
-// keystroke has three or four spellings depending on which protocol
-// the terminal negotiated: Ctrl+C is byte 0x03 in the legacy world,
-// `CSI 27 ; 5 ; 99 ~` under xterm's modifyOtherKeys, and
-// `CSI 99 ; 5 u` under the kitty protocol.  This module is the value
-// all three decode TO, so that a program's key handling is written
-// once and the protocol is a detail of the decoder.
+// The model is crossterm's, with one addition.  A key is a named key, a
+// character, or a keypad key, plus a set of modifiers, which is
+// crossterm's `KeyEvent` and what every terminal program written
+// against it reads.  The addition is `KeyMotion`, because the kitty
+// protocol reports releases and repeats and a program that wanted them
+// had nowhere to put them.  A legacy decode carries `KeyDownEvent`,
+// which is what a legacy terminal knows.
 //
-// THE MODEL IS crossterm's, WITH ONE ADDITION.  A key is a named key,
-// a character, or a keypad key, plus a set of modifiers — that much is
-// crossterm and ratatui and every terminal program written against
-// them.  The addition is `KeyMotion`: the kitty protocol reports
-// releases and repeats, and a program that wanted them had nowhere to
-// put them.  A legacy decoder reports `KeyDownEvent` for everything,
-// which is exactly what a legacy terminal knows.
-//
-// WHAT IS DELIBERATELY MISSING.  Any notion of a binding, a chord, a
-// leader key or a mode.  A keymap in the editor sense is a program's
-// configuration, and a package that shipped one would be shipping
-// somebody's taste; what this package owes a program is an
-// unambiguous value to look up.
+// A binding, a chord, a leader key and a mode are not here.  A keymap in
+// the editor sense is a program's configuration.  What this package owes
+// a program is an unambiguous value to look up.
 
 // KeyName is a key that has a name rather than a character.
 //
-// The set is closed on purpose, with `KeyFunction` taking a number
-// rather than there being thirty-five variants.  A terminal that sends
-// something outside it sends a sequence the decoder reports as
-// unrecognised, which is a better answer than an invented variant a
-// program would have to guess the meaning of.
+// The set is closed, with `KeyFunction` taking a number rather than
+// there being thirty-five variants.  A terminal that sends something
+// outside it sends a sequence the decoder reports as unrecognised,
+// which is a better answer than an invented variant a program would
+// have to guess the meaning of.
 pub enum KeyName
     KeyEnter
     KeyTab
-    // Shift+Tab, which is a different sequence rather than Tab with a
-    // modifier in most protocols — so it is a key here, and a decoder
-    // that folded it into `KeyTab` with shift would be inventing an
-    // equivalence the terminal did not send.
+    // Shift and Tab, which is a sequence of its own rather than Tab
+    // with a modifier in most protocols.  It is a key here, and a
+    // decoder that folded it into `KeyTab` with shift would be
+    // inventing an equivalence the terminal did not send.
     KeyBackTab
     KeyBackspace
-    // The Escape key ITSELF, once the ambiguity in `keydecode` has
-    // been resolved.  It is never reported from a lone ESC byte until
-    // the caller's `flush` says the read timed out.
+    // The Escape key itself, once the ambiguity in `keydecode` has been
+    // resolved.  It is never reported from a lone ESC byte until the
+    // caller's `flush` says the read timed out.
     KeyEscape
     KeyInsert
     KeyDelete
@@ -55,7 +51,7 @@ pub enum KeyName
     KeyDown
     KeyLeft
     KeyRight
-    // F1..F35, by number.
+    // F1 to F35, by number.
     KeyFunction(n: Int)
     KeyMenu
     KeyPrintScreen
@@ -79,10 +75,10 @@ pub enum KeyName
 // KeyPadKey is a key on the numeric keypad, reported separately from
 // the character it produces.
 //
-// It is its own type because the distinction is real and only the
-// kitty protocol makes it: keypad 5 and the 5 above the letters send
-// the same byte in the legacy world, and a program that binds one
-// binds both. `KeyPadBegin` is keypad 5 with NumLock off, which sends
+// It is its own type because the distinction is real and only the kitty
+// protocol makes it.  Keypad 5 and the 5 above the letters send the
+// same byte in the legacy world, and a program that binds one binds
+// both.  `KeyPadBegin` is keypad 5 with NumLock off, which sends
 // nothing at all on most terminals and is why the variant is here
 // rather than folded into `KeyPadDigit(5)`.
 pub enum KeyPadKey
@@ -99,21 +95,21 @@ pub enum KeyPadKey
 // KeyPress is what was pressed: a character, a named key, or a keypad
 // key.
 pub enum KeyPress
-    // A codepoint.  Ctrl+C decodes to `KeyChar(0x63)` with `ctrl` set
-    // — the letter, not the control byte — because a program that
-    // matched on 0x03 would be matching on the encoding.
+    // A codepoint.  Ctrl and `c` decodes to `KeyChar(0x63)` with `ctrl`
+    // set, which is the letter rather than the control byte, because a
+    // program that matched on 0x03 would be matching on the encoding.
     KeyChar(codepoint: Int)
     KeyNamed(name: KeyName)
     KeyPad(pad: KeyPadKey)
 
 // KeyMods is which modifiers were held.
 //
-// Four rather than the kitty protocol's eight: shift, alt, ctrl and
-// the platform key.  Hyper and Meta are folded into `meta` because no
+// Four rather than the kitty protocol's eight: shift, alt, ctrl and the
+// platform key.  Hyper and Meta are folded into `meta` because no
 // program distinguishes them, and the two lock states are reported as
-// keys (`KeyCapsLock`, `KeyNumLock`) rather than as modifiers, because
-// that is what they are — a program that wants the lock STATE is
-// tracking it, and this package reports events.
+// keys rather than as modifiers, because that is what they are.  A
+// program that wants the lock state is tracking it, and this package
+// reports events.
 pub struct KeyMods
     shift: Bool
     alt: Bool
@@ -124,9 +120,9 @@ pub struct KeyMods
 
 // KeyMotion is whether the key went down, repeated, or came up.
 //
-// Only the kitty protocol reports the last two, and only when a
-// program asked it to.  Every legacy decode is `KeyDownEvent`, which
-// is honest: a legacy terminal genuinely does not know.
+// Only the kitty protocol reports the last two, and only when a program
+// asked it to.  Every legacy decode is `KeyDownEvent`, because a legacy
+// terminal does not know.
 pub enum KeyMotion
     KeyDownEvent
     KeyRepeatEvent
@@ -139,45 +135,89 @@ pub struct KeyStroke
     mods: KeyMods
     motion: KeyMotion
 
+// The first of the six modifier bits xterm's modifier parameter
+// carries, which is shift.  The parameter is one plus the sum of the
+// bits that were held.
+const MOD_SHIFT = 1
+const MOD_ALT = 2
+const MOD_CTRL = 4
+// Super, Hyper and Meta are bits 8, 16 and 32 of the kitty protocol's
+// modifier set.  All three arrive in `meta`.
+const MOD_PLATFORM = 56
+
 // no_mods is the modifier set with nothing held.
 pub fn no_mods() -> KeyMods
-    todo("keymap-nv.keymodel.no_mods")
+    KeyMods { shift: false, alt: false, ctrl: false, meta: false }
 
-// mods_of reads xterm's modifier parameter — the number in
-// `CSI 1 ; 5 A`, which is one plus a bitmask.
+// mods_of reads xterm's modifier parameter, which is the number in
+// `CSI 1 ; 5 A` and is one plus a bitmask.
 //
-// The plus-one is the trap: a modifier parameter of 1 means NOTHING
-// held, and a decoder that read the bitmask straight reports shift for
-// every unmodified arrow key.
+// A modifier parameter of 1 means nothing held, and a parameter below 1
+// is a sequence that carried no modifier at all.  A decoder that read
+// the bitmask straight reports shift for every unmodified arrow key.
+// See xterm's `ctlseqs`, "PC-Style Function Keys".
+//
+// ```novo
+// use keymodel
+//
+// fn main() [io]
+//     let m = keymodel.mods_of(5)
+//     println("${m.ctrl} ${m.shift}")   // true false
+// ```
 pub fn mods_of(param: Int) -> KeyMods
-    todo("keymap-nv.keymodel.mods_of")
+    if param < 2
+        return no_mods()
+    let mask = param - 1
+    KeyMods { shift: (mask & MOD_SHIFT) > 0,
+              alt: (mask & MOD_ALT) > 0,
+              ctrl: (mask & MOD_CTRL) > 0,
+              meta: (mask & MOD_PLATFORM) > 0 }
 
-// mods_param is the inverse: the number a modifier set goes on the
-// wire as, one plus the bitmask.
+// mods_param is the inverse: the number a modifier set goes on the wire
+// as, one plus the bitmask.
 //
-// Public because a program that generates input — a test harness, a
-// terminal multiplexer forwarding a key to a child — needs to write
-// the sequence it would have read.
+// `meta` goes back out as the super bit, which is the lowest of the
+// three the model folds together.
+//
+// Public because a program that generates input needs to write the
+// sequence it would have read.  A test harness and a terminal
+// multiplexer forwarding a key to a child are both such programs.
 pub fn mods_param(m: KeyMods) -> Int
-    todo("keymap-nv.keymodel.mods_param")
+    var mask = 0
+    if m.shift
+        mask = mask + MOD_SHIFT
+    if m.alt
+        mask = mask + MOD_ALT
+    if m.ctrl
+        mask = mask + MOD_CTRL
+    if m.meta
+        mask = mask + 8
+    mask + 1
 
 // mods_any says whether any modifier at all is held.
 pub fn mods_any(m: KeyMods) -> Bool
-    todo("keymap-nv.keymodel.mods_any")
+    m.shift or m.alt or m.ctrl or m.meta
 
 // mods_eq says whether two modifier sets are the same.
 pub fn mods_eq(a: KeyMods, b: KeyMods) -> Bool
-    todo("keymap-nv.keymodel.mods_eq")
+    a == b
 
 // stroke_eq says whether two keystrokes are the same event.
 //
-// The function a program's key table is looked up with, which is why
-// it is here rather than left to a consumer to write from the fields:
-// comparing a `KeyPress` means comparing a nested enum, and every
-// consumer writing that by hand is every consumer getting
-// `KeyFunction` wrong once.
+// The function a program's key table is looked up with, which is why it
+// is here rather than left to a consumer to write from the fields.  The
+// press, the modifiers and the motion all have to agree, and a keystroke
+// that repeated is not the one that went down.
+//
+// ```novo
+// use keymodel
+//
+// fn main() [io]
+//     let up = keymodel.named_key(KeyUp)
+//     println("${keymodel.stroke_eq(up, keymodel.named_key(KeyUp))}")   // true
+// ```
 pub fn stroke_eq(a: KeyStroke, b: KeyStroke) -> Bool
-    todo("keymap-nv.keymodel.stroke_eq")
+    a == b
 
 // char_key is the keystroke for an unmodified character.
 //
@@ -190,39 +230,72 @@ pub fn stroke_eq(a: KeyStroke, b: KeyStroke) -> Bool
 //         println("q")
 // ```
 pub fn char_key(codepoint: Int) -> KeyStroke
-    todo("keymap-nv.keymodel.char_key")
+    KeyStroke { press: KeyChar(codepoint), mods: no_mods(), motion: KeyDownEvent }
 
 // named_key is the keystroke for an unmodified named key.
 pub fn named_key(name: KeyName) -> KeyStroke
-    todo("keymap-nv.keymodel.named_key")
+    KeyStroke { press: KeyNamed(name), mods: no_mods(), motion: KeyDownEvent }
 
-// ctrl_key is the keystroke for a character with Ctrl held — the
-// spelling a program's key table wants for `Ctrl+C`.
+// ctrl_key is the keystroke for a character with Ctrl held, which is
+// the spelling a program's key table wants for Ctrl and `c`.
 pub fn ctrl_key(codepoint: Int) -> KeyStroke
-    todo("keymap-nv.keymodel.ctrl_key")
+    KeyStroke { press: KeyChar(codepoint),
+                mods: KeyMods { shift: false, alt: false, ctrl: true, meta: false },
+                motion: KeyDownEvent }
 
 // with_mods is a keystroke with its modifiers replaced.
 pub fn with_mods(k: KeyStroke, m: KeyMods) -> KeyStroke
-    todo("keymap-nv.keymodel.with_mods")
+    KeyStroke { press: k.press, mods: m, motion: k.motion }
 
-// control_char is the C0 byte a Ctrl+letter would have arrived as in
+// control_char is the C0 byte a character with Ctrl held arrives as in
 // the legacy encoding, or `None` for a character that has none.
 //
-// The inverse of the decoder's own rule, and it is `pub` because a
-// program that has to WRITE a key to a child process — a multiplexer,
-// a test — needs the byte a terminal would have sent, and because a
-// reader comparing the two encodings should not have to re-derive the
-// mapping.
+// The domain is the space, the letters in either case, and the digits
+// `4` to `7`, which is the set crossterm reads back.  A letter answers
+// the same byte whether or not shift was also held, because the legacy
+// encoding has one byte for both.
+//
+// `char_of_control` is the inverse everywhere except at three bytes.
+// Ctrl and `i` is 0x09, Ctrl and `m` is 0x0D, and Ctrl and `[` is 0x1B;
+// those bytes are Tab, Enter and Escape, and the inverse answers `None`
+// for them because a key is what they are.
+//
+// It is `pub` because a program that has to write a key to a child
+// process needs the byte a terminal would have sent, and because a
+// reader comparing the two encodings should not have to derive the
+// mapping again.
 pub fn control_char(codepoint: Int) -> ?Int
-    todo("keymap-nv.keymodel.control_char")
+    if codepoint == ' '
+        Some(0)
+    else if codepoint >= 'a' and codepoint <= 'z'
+        Some(codepoint - 0x60)
+    else if codepoint >= 'A' and codepoint <= 'Z'
+        Some(codepoint - 0x40)
+    else if codepoint >= '4' and codepoint <= '7'
+        Some(codepoint - 0x18)
+    else
+        None
 
-// char_of_control is the letter a C0 byte stands for — 0x03 to `c` —
-// or `None` for a byte that is a key in its own right, like 0x09 (Tab)
-// or 0x0D (Enter).
+// char_of_control is the character a C0 byte stands for, 0x03 to `c`,
+// or `None` for a byte that is a key in its own right.
+//
+// 0x09 is Tab, 0x0D is Enter and 0x1B is Escape, and those three answer
+// `None`.  0x00 is the space with Ctrl held, and 0x1C to 0x1F are the
+// digits `4` to `7` with Ctrl held, which is crossterm's reading of
+// them.
 //
 // Those exceptions are the whole reason this is a function rather than
-// an arithmetic step a caller writes inline: Ctrl+I and Tab are the
-// same byte, and a decoder that reported the first would report Tab as
-// Ctrl+I forever.
+// an arithmetic step a caller writes inline.  Ctrl and `i` and Tab are
+// the same byte, and a decoder that reported the first would report Tab
+// as Ctrl and `i` forever.
 pub fn char_of_control(byte: Int) -> ?Int
-    todo("keymap-nv.keymodel.char_of_control")
+    if byte == 0x09 or byte == 0x0D or byte == 0x1B
+        None
+    else if byte == 0
+        Some(' ')
+    else if byte >= 1 and byte <= 26
+        Some(byte + 0x60)
+    else if byte >= 0x1C and byte <= 0x1F
+        Some(byte + 0x18)
+    else
+        None

@@ -1,61 +1,59 @@
 // mousedecode.nv — a mouse report, and the three encodings a terminal
 // might send it in.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// X10 is what every terminal has spoken since 1984, and it cannot say
+// anything past column 223, because each coordinate is one byte with 32
+// added to it.  SGR is what fixed that and is what a program should ask
+// for; it is also the only encoding that distinguishes a press from a
+// release, because its final byte says which.  urxvt's is a third
+// spelling, still sent by rxvt-unicode.  A program decodes whichever
+// arrives and works with `MouseReport`.
 //
-// THREE ENCODINGS, ONE VALUE.  X10 is what every terminal has spoken
-// since 1984 and it cannot say anything past column 223, because the
-// coordinate is one byte with 32 added to it.  SGR is what fixed that
-// and is what a program should ask for; it is also the only encoding
-// that distinguishes a press from a release, because the final byte
-// says which.  urxvt's is a third spelling nobody needed, still sent
-// by rxvt-unicode.  A program decodes whichever arrives and works with
-// `MouseReport`.
+// The button and the modifiers share a byte, which is the single
+// biggest source of wrong mouse handling.  Bits 0 and 1 are the button,
+// bit 2 is shift, bit 3 is meta, bit 4 is ctrl, bit 5 is motion, bit 6
+// means the low two bits are a wheel direction rather than a button,
+// and bit 7 means they are one of buttons 8 to 11.  `decode_button` is
+// that table written once.  See xterm's `ctlseqs`, "Mouse Tracking".
 //
-// THE BUTTON AND THE MODIFIERS SHARE A BYTE, which is the single
-// biggest source of wrong mouse handling: bits 0 and 1 are the button,
-// bit 2 is shift, bit 3 is meta, bit 4 is ctrl, bit 5 is motion, and
-// bit 6 means "this is a wheel event and the low two bits are a wheel
-// direction rather than a button".  `decode_button` is that table
-// written once.
-//
-// THE COORDINATES ARE THE TERMINAL'S — one-based, column then row, as
-// they arrive.  A library that helpfully made them zero-based would be
-// a library every caller adds one back for; tui-nv's buffer is
-// zero-based and the conversion happens at that boundary, once.
+// The coordinates are the terminal's, one-based and column first, as
+// they arrive.  A library that made them zero-based would be a library
+// every caller adds one back for.  tui-nv's buffer is zero-based and
+// the conversion happens at that boundary, once.
 
 use keymodel
 
 // MouseEncoding is which spelling a report arrived in.
 //
-// Reported on the report because a program that wants to reason about
-// what its terminal supports — or a multiplexer re-encoding for a
-// child — needs to know which one it got, and because the X10 ceiling
-// is a real limitation a program may want to warn about.
+// It is reported on the report because a program that wants to reason
+// about what its terminal supports needs to know which one it got, and
+// because the X10 ceiling is a limitation a program may want to warn
+// about.  A multiplexer re-encoding a click for a child needs it too.
 pub enum MouseEncoding
-    // `CSI M <button+32> <col+32> <row+32>` — three raw bytes, and
+    // `CSI M <button+32> <col+32> <row+32>`, three raw bytes, and
     // nothing past column or row 223 can be said.
     MouseX10Encoding
     // `CSI < <button> ; <col> ; <row> M` for a press and `m` for a
     // release.  Unbounded coordinates, and the only encoding that
     // distinguishes the two.
     MouseSgrEncoding
-    // `CSI <button+32> ; <col> ; <row> M` — rxvt-unicode's.  Unbounded
-    // coordinates; a release is reported as button 3, exactly as in
-    // X10, so which button was let go is unknowable.
+    // `CSI <button+32> ; <col> ; <row> M`, which is rxvt-unicode's.
+    // Unbounded coordinates, and a release reported as button 3 exactly
+    // as in X10, so which button was let go is unknowable.
     MouseUrxvtEncoding
 
 // MouseButtonKind is which button, or which way the wheel turned.
 //
-// The wheel is a button in every one of the three encodings, which is
-// a historical accident rather than a model — so it is decoded into
-// its own variants here, and a program that switches on
-// `MouseWheelUp` does not have to remember that it is button 64.
+// The wheel is a button in every one of the three encodings, which is a
+// historical accident rather than a model.  It is decoded into its own
+// variants here, so a program that switches on `MouseWheelUp` does not
+// have to remember that it is button 64.
 pub enum MouseButtonKind
     MouseLeft
     MouseMiddle
     MouseRight
-    // A motion report with no button held, which only mode 1003 sends.
+    // A motion report with no button held, which only mode 1003 sends,
+    // and the button of a release the encoding could not name.
     MouseNoButton
     MouseWheelUp
     MouseWheelDown
@@ -63,16 +61,16 @@ pub enum MouseButtonKind
     // handles.
     MouseWheelLeft
     MouseWheelRight
-    // Buttons 8..11, which some mice have and xterm reports.
+    // Buttons 8 to 11, which some mice have and xterm reports.
     MouseExtraButton(n: Int)
 
 // MouseAction is what happened to the button.
 //
-// `MouseReleased` is only ever reported from the SGR encoding.  The
-// other two spell a release as button 3, which says a button was let
-// go and not which one — so a decoder reports `MouseReleased` with
-// `MouseNoButton`, and the ambiguity is visible in the value rather
-// than hidden by a guess.
+// `MouseReleased` is only ever reported with a named button from the
+// SGR encoding.  The other two spell a release as button 3, which says
+// a button was let go and not which one, so a decoder reports
+// `MouseReleased` with `MouseNoButton` and the ambiguity is visible in
+// the value rather than hidden by a guess.
 pub enum MouseAction
     MousePressed
     MouseReleased
@@ -90,54 +88,161 @@ pub struct MouseReport
     row: Int
     encoding: MouseEncoding
 
-// The largest coordinate the X10 encoding can express.  A terminal
-// past this column sends 223 forever, and a program on a wide screen
-// that has not asked for SGR mode is reading a lie.
+// The largest coordinate the X10 encoding can express.  A terminal past
+// this column sends 223 forever, and a program on a wide screen that
+// has not asked for SGR mode is reading a lie.
 pub const X10_COORD_MAX = 223
+
+// What X10 adds to the button byte and to each coordinate, so that
+// every byte of a report is printable.  It is also what makes 223 the
+// ceiling, because 255 is the largest byte there is.
+const COORD_OFFSET = 32
+
+// The fields of the button byte, by value rather than by bit number.
+const BUTTON_MASK = 3
+const BIT_SHIFT = 4
+const BIT_META = 8
+const BIT_CTRL = 16
+const BIT_MOTION = 32
+const BIT_WHEEL = 64
+const BIT_EXTRA = 128
+
+// The low two bits of a wheel event, as a direction.
+fn wheel_of(low: Int) -> MouseButtonKind
+    if low == 0
+        MouseWheelUp
+    else if low == 1
+        MouseWheelDown
+    else if low == 2
+        MouseWheelLeft
+    else
+        MouseWheelRight
+
+// The low two bits of a button event, as a button.  Button 3 is the
+// release in the two encodings that have no other way to spell one, and
+// it names no button.
+fn button_of(low: Int) -> MouseButtonKind
+    if low == 0
+        MouseLeft
+    else if low == 1
+        MouseMiddle
+    else if low == 2
+        MouseRight
+    else
+        MouseNoButton
+
+// Whether the button byte says a button was let go.  It is button 3
+// with neither the wheel bit nor the extra-button bit set, which is how
+// X10 and urxvt spell a release.
+fn is_release(code: Int) -> Bool
+    (code & BIT_WHEEL) == 0 and (code & BIT_EXTRA) == 0 and (code & BUTTON_MASK) == BUTTON_MASK
+
+// The action an X10 or urxvt button byte describes.  Motion is read
+// first, because a drag carries the button that is held as well as the
+// motion bit.
+fn action_of(code: Int) -> MouseAction
+    if is_motion(code)
+        MouseMoved
+    else if is_release(code)
+        MouseReleased
+    else
+        MousePressed
+
+// One report, from a button byte with the X10 offset already taken off.
+fn report_of(code: Int, col: Int, row: Int, encoding: MouseEncoding) -> MouseReport
+    MouseReport { button: decode_button(code), action: action_of(code),
+                  mods: decode_mods(code), col: col, row: row,
+                  encoding: encoding }
 
 // decode_button reads the button byte's fields.
 //
-// The one table three encodings share, written once: the low two bits
-// are the button, bits 2..4 are the modifiers, bit 5 is motion, bit 6
-// puts the low bits into the wheel's meaning and bit 7 puts them into
-// buttons 8..11.
+// The one table three encodings share, written once.  The low two bits
+// are the button, bit 6 puts them into the wheel's meaning and bit 7
+// into buttons 8 to 11.
+//
+// ```novo
+// use mousedecode
+//
+// fn main() [io]
+//     match mousedecode.decode_button(64)
+//         MouseWheelUp => println("the wheel turned up")
+//         _            => println("a button")
+// ```
 pub fn decode_button(code: Int) -> MouseButtonKind
-    todo("keymap-nv.mousedecode.decode_button")
+    if (code & BIT_EXTRA) > 0
+        MouseExtraButton(8 + (code & BUTTON_MASK))
+    else if (code & BIT_WHEEL) > 0
+        wheel_of(code & BUTTON_MASK)
+    else
+        button_of(code & BUTTON_MASK)
 
 // decode_mods reads the modifier bits out of the same button byte.
+//
+// Bit 3 is the one xterm's `ctlseqs` calls meta, and it arrives in
+// `meta` under the name the reference gives it.  There is no bit for a
+// mouse report's alt.
 pub fn decode_mods(code: Int) -> keymodel.KeyMods
-    todo("keymap-nv.mousedecode.decode_mods")
+    KeyMods { shift: (code & BIT_SHIFT) > 0, alt: false,
+              ctrl: (code & BIT_CTRL) > 0, meta: (code & BIT_META) > 0 }
 
 // is_motion says whether the button byte's motion bit is set.
 pub fn is_motion(code: Int) -> Bool
-    todo("keymap-nv.mousedecode.is_motion")
+    (code & BIT_MOTION) > 0
 
 // button_code is the inverse of `decode_button` and `decode_mods`
-// together: the byte a report goes on the wire as.
+// together: the byte a report goes on the wire as, before X10 adds its
+// offset.
 //
-// Public for the same reason `keymodel.mods_param` is: a multiplexer
+// Public for the same reason `keymodel.mods_param` is.  A multiplexer
 // forwarding a click to a child, and a test feeding a program a
 // synthetic terminal, both need to write what they would have read.
 pub fn button_code(button: MouseButtonKind, mods: keymodel.KeyMods, motion: Bool) -> Int
-    todo("keymap-nv.mousedecode.button_code")
+    var code = base_code(button)
+    if mods.shift
+        code = code + BIT_SHIFT
+    if mods.meta
+        code = code + BIT_META
+    if mods.ctrl
+        code = code + BIT_CTRL
+    if motion
+        code = code + BIT_MOTION
+    code
+
+// The button byte of a button with nothing held.
+fn base_code(button: MouseButtonKind) -> Int
+    match button
+        MouseLeft           => 0
+        MouseMiddle         => 1
+        MouseRight          => 2
+        MouseNoButton       => 3
+        MouseWheelUp        => BIT_WHEEL
+        MouseWheelDown      => BIT_WHEEL + 1
+        MouseWheelLeft      => BIT_WHEEL + 2
+        MouseWheelRight     => BIT_WHEEL + 3
+        MouseExtraButton(n) => BIT_EXTRA + ((n - 8) & BUTTON_MASK)
 
 // report_x10 assembles a report from the three raw bytes that follow
 // `CSI M`.
 //
 // The bytes arrive with 32 added to each, which is why they are three
-// RAW bytes and not parameters: a coordinate of 59 is the byte `;`,
-// and a CSI parameter scanner would have read it as a separator.  That
-// is the case that makes this package's decoder its own state machine
-// rather than a layer over ansi-nv's.
+// raw bytes and not parameters.  A coordinate of 59 is the byte `;`,
+// and a parameter scanner would have read it as a separator.  That is
+// the case that makes this package's decoder its own state machine.
+//
+// A byte below 32 is not part of any report and answers `None`.
 pub fn report_x10(b1: Int, b2: Int, b3: Int) -> ?MouseReport
-    todo("keymap-nv.mousedecode.report_x10")
+    if b1 < COORD_OFFSET or b2 < COORD_OFFSET or b3 < COORD_OFFSET
+        return None
+    Some(report_of(b1 - COORD_OFFSET, b2 - COORD_OFFSET, b3 - COORD_OFFSET,
+                   MouseX10Encoding))
 
 // report_sgr assembles a report from the SGR encoding's three
 // parameters and its final byte.
 //
 // `final_byte` is `M` for a press and `m` for a release, and it is the
 // only place in any of the three encodings where a release says which
-// button it was.
+// button it was.  Any other final byte answers `None`, as does a
+// coordinate below one, because SGR coordinates are one-based.
 //
 // ```novo
 // use mousedecode
@@ -153,20 +258,40 @@ pub fn report_x10(b1: Int, b2: Int, b3: Int) -> ?MouseReport
 //         None => println("not a report")
 // ```
 pub fn report_sgr(button_byte: Int, col: Int, row: Int, final_byte: Int) -> ?MouseReport
-    todo("keymap-nv.mousedecode.report_sgr")
+    if button_byte < 0 or col < 1 or row < 1
+        return None
+    if final_byte == 'M'
+        Some(report_of(button_byte, col, row, MouseSgrEncoding))
+    else if final_byte == 'm'
+        Some(MouseReport { button: decode_button(button_byte),
+                           action: MouseReleased,
+                           mods: decode_mods(button_byte), col: col, row: row,
+                           encoding: MouseSgrEncoding })
+    else
+        None
 
-// report_urxvt assembles a report from rxvt-unicode's three
-// parameters, the first of which carries the same +32 offset X10 uses.
+// report_urxvt assembles a report from rxvt-unicode's three parameters,
+// the first of which carries the same offset X10 adds.
+//
+// A first parameter below 32 is not a report and answers `None`, as
+// does a coordinate below one.
 pub fn report_urxvt(button_byte: Int, col: Int, row: Int) -> ?MouseReport
-    todo("keymap-nv.mousedecode.report_urxvt")
+    if button_byte < COORD_OFFSET or col < 1 or row < 1
+        return None
+    Some(report_of(button_byte - COORD_OFFSET, col, row, MouseUrxvtEncoding))
 
 // is_wheel says whether a report is a wheel turn rather than a button.
 //
-// A convenience with a reason: scrolling is the one mouse event most
-// programs handle and the one whose encoding as a button is most
+// A convenience with a reason.  Scrolling is the one mouse event most
+// programs handle, and the one whose encoding as a button is most
 // surprising, so the question a program actually asks gets a name.
 pub fn is_wheel(r: MouseReport) -> Bool
-    todo("keymap-nv.mousedecode.is_wheel")
+    match r.button
+        MouseWheelUp    => true
+        MouseWheelDown  => true
+        MouseWheelLeft  => true
+        MouseWheelRight => true
+        _               => false
 
 // coordinates_are_exact says whether a report's column and row can be
 // trusted.
@@ -174,6 +299,9 @@ pub fn is_wheel(r: MouseReport) -> Bool
 // `false` for an X10 report at the 223 ceiling, where the terminal has
 // clamped and the true position is unknown.  A program on a wide
 // terminal that has not asked for SGR mode needs this to be a question
-// it can ask rather than a wrong answer it acts on.
+// it can ask rather than a wrong answer it acts on.  The other two
+// encodings send their coordinates as numbers and have no ceiling.
 pub fn coordinates_are_exact(r: MouseReport) -> Bool
-    todo("keymap-nv.mousedecode.coordinates_are_exact")
+    match r.encoding
+        MouseX10Encoding => r.col < X10_COORD_MAX and r.row < X10_COORD_MAX
+        _                => true
