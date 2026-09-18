@@ -5,6 +5,80 @@ All notable changes to keymap-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-09-18
+
+The bodies.  Bytes in, key and mouse events out, over the legacy escape
+forms, xterm's modifyOtherKeys, the kitty keyboard protocol, the three
+mouse encodings, bracketed paste, focus events and UTF-8 — and no
+signature changed.
+
+- The decoder is the held bytes and nothing else.  Every byte re-reads
+  what is held from the start, so one buffer serves an escape sequence,
+  a codepoint that arrived a byte at a time, and the end marker of a
+  paste.  The work per byte is bounded by `sequence_bytes_max`.
+- A lone ESC is held, and `flush` is what resolves it.  An ESC in front
+  of anything else is the alt prefix, so `ESC x` is Alt and `x` and
+  `ESC ESC [ A` is Alt and the up arrow.  A run of escapes that never
+  resolves comes back from `flush` as one Escape key per byte.
+- A character outside ASCII arrives as its UTF-8 bytes and is assembled
+  into one `KeyChar`.  The bytes are held the way a sequence's bytes
+  are, so a codepoint split across two reads costs nothing.  The
+  continuation bytes are taken as the lead byte promises them, without
+  a check; the README says so under what is not included.
+- Tab, Enter and Backspace are keys.  Every other C0 byte is its letter
+  with ctrl held, which is crossterm's reading, so 0x08 is Ctrl and `h`
+  and 0x0A is Ctrl and `j`.
+- `CSI Z` is Shift and Tab, which is the only spelling `KeyBackTab` has;
+  `CSI R` is left unread, because it is the reply to a cursor position
+  query and a program that asked for one has to be able to see it.
+- A bracketed paste reports every byte it was given, in order.  During
+  one the decoder holds at most the five bytes of a half-arrived end
+  marker, and reports them as pasted text as soon as a byte proves they
+  were not the marker.  A `flush` inside a paste reports what is held
+  and leaves the paste open.
+- One parameter stops growing at 65535 rather than wrapping.  A
+  sequence carrying a longer run of digits reaches a number no form
+  here claims and is reported by its final byte.
+- Four suites, 81 tests, and every line under `src/` executed by them.
+  `bash tests/coverage.sh` merges the per-suite LCOV and prints the
+  number, which is 100%.
+
+### Changed
+
+- **The device claim is withdrawn, and `tests/embedded_probe.nv` is
+  gone.**  The interface release linked for `--target=nrf52-qemu`
+  because every body was a `todo()` and nothing was constructed.  With
+  bodies, `novo build --target=nrf52-qemu` refuses the package:
+  `KeyMods`, `KeyStroke` and `MouseReport` are boxed structs, and
+  `KeyPress`, `KeyName`, `KeyPadKey`, `MouseButtonKind` and `KeyEvent`
+  each carry a variant with a payload, all of which are heap cells at
+  that tier.  A device build needs `@value` structs and a discriminant
+  field in place of each payload-carrying variant, which is a different
+  published interface rather than a different implementation.  The
+  README says what it would take.
+
+### Known
+
+- **win32-input-mode is not covered**, and `protocol_refusal` says so
+  with a reason rather than by silence.
+- **The kitty protocol's remaining names have no variant here.**  The
+  modifier keys themselves, ten keypad keys that duplicate a named key,
+  and three media keys arrive as `KeyUnknownSequence`, which carries the
+  final byte and not the number.
+- **A mouse report's bit 3 is reported as `meta`**, which is the name
+  xterm's `ctlseqs` gives it.  A program that treats the same bit as alt
+  reads `mods.meta`.
+
+### Fixed elsewhere
+
+Three toolchain defects were found writing this release and are filed
+against the compiler rather than worked around in the design:
+`memory-perceus/nested-pattern-binding-returned-from-an-arm-aliases-the-next-result`,
+`memory-perceus/call-returned-struct-in-a-match-scrutinee-is-never-released`
+and
+`memory-perceus/list-map-leaks-a-box-per-element-when-the-lambda-builds-an-enum-variant`.
+The last one is named at the one site that avoids it.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide

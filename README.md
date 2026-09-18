@@ -11,12 +11,6 @@ xterm's `modifyOtherKeys`, and
 [termios-nv](https://novo-lang.org/packages/termios-nv) is built on it
 and supplies the reading half.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What it is
 
 Press `q` at a terminal and the byte 0x71 arrives. Press Ctrl and `c`
@@ -40,6 +34,10 @@ A **modifier set** is shift, alt, ctrl and the platform key. On the wire
 it is a single number, and that number is one plus a bitmask, so a
 modifier parameter of 1 means nothing was held.
 
+A character the keyboard produces arrives as **UTF-8**, which is one to
+four bytes for one codepoint. The bytes of a codepoint arrive the way
+the bytes of a sequence do, and the decoder holds them the same way.
+
 The **mouse** is reported as a sequence too, in one of three encodings.
 The button and the modifiers share one byte in all three, laid out the
 same way.
@@ -52,6 +50,7 @@ same way.
 | 4 | ctrl |
 | 5 | the pointer moved |
 | 6 | this is a wheel event |
+| 7 | this is one of buttons 8 to 11 |
 
 A **bracketed paste** is pasted text wrapped in `CSI 200 ~` and
 `CSI 201 ~`, so that a program can tell pasted text from typing. The
@@ -70,6 +69,8 @@ and who is the only party that could know — calls `flush`.
 | Highest column or row the X10 mouse encoding can express | 223 |
 | Modifier parameter that means nothing is held | 1 |
 | Modifiers reported | 4 |
+| Bytes of one escape sequence held by default | 64 |
+| Largest value one parameter may hold | 65535 |
 
 ## Install
 
@@ -114,10 +115,7 @@ fn main() [io]
         println(str.from_int(list.len(done.events)))
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: keymap-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -133,18 +131,19 @@ specification the implementation will have to satisfy.
 gives a chunk, and whatever the chunk did not finish stays held for the
 next one. This is what a read loop uses.
 
-**`keydecode.feed_byte` takes one byte.** It allocates nothing and
-answers at most one event. Most bytes of a sequence complete nothing.
-Use it on a device, or where the bytes arrive one at a time anyway.
+**`keydecode.feed_byte` takes one byte.** It answers at most one event.
+Most bytes of a sequence complete nothing. Use it where the bytes arrive
+one at a time anyway.
 
 **`keydecode.flush` resolves what is held.** Call it after a read that
 timed out. On a decoder that is holding nothing it produces nothing and
 is harmless, so it need not be guarded.
 
 **`keydecode.decode_one` takes one complete sequence.** It answers
-`None` for a prefix or for bytes this package does not recognise. It is
-for the two callers that are not read loops: a test with a fixture, and
-a program whose key bindings are written as the bytes a terminal sends.
+`None` for a prefix, for bytes this package does not recognise, and for
+a chunk that holds more than one sequence. It is for the two callers
+that are not read loops: a test with a fixture, and a program whose key
+bindings are written as the bytes a terminal sends.
 
 ## The rules a user needs
 
@@ -169,65 +168,84 @@ a program whose key bindings are written as the bytes a terminal sends.
    is not reported as the control byte. `keymodel.control_char` gives
    the byte a legacy terminal would have sent, for a program that has to
    write one.
-7. **Tab and Enter are keys, not control characters.** Ctrl and `i` is
-   byte 0x09, which is also Tab, and Ctrl and `m` is byte 0x0D, which is
-   also Enter. `keymodel.char_of_control` answers `None` for those bytes
-   rather than claiming a letter.
+7. **Tab, Enter and Backspace are keys, not control characters.** Ctrl
+   and `i` is byte 0x09, which is also Tab, and Ctrl and `m` is byte
+   0x0D, which is also Enter. `keymodel.char_of_control` answers `None`
+   for those bytes rather than claiming a letter. Backspace is 0x7F,
+   which is the byte a terminal sends for that key; 0x08 is Ctrl and
+   `h`, and 0x0A is Ctrl and `j`.
 8. **Only the kitty protocol reports releases and repeats.** Every
    legacy decode carries `KeyDownEvent`, which is what a legacy terminal
    knows. See the kitty keyboard protocol, "Event types".
-9. **Mouse coordinates are one-based, column first, exactly as the
-   terminal sends them.** tui-nv's buffer is zero-based and converts at
-   that boundary. See xterm's `ctlseqs`, "Mouse Tracking".
-10. **The X10 mouse encoding cannot say anything past 223.** A terminal
+9. **A character outside ASCII arrives as its UTF-8 bytes.** The decoder
+   assembles them into one `KeyChar` with the codepoint. A lead byte
+   that promises continuation bytes is held until they arrive, so
+   `is_pending` is true in the middle of a codepoint as well as in the
+   middle of a sequence. A byte that leads no codepoint — 0x80 to 0xC1,
+   or 0xF5 and above — is reported as a character with that value.
+10. **Mouse coordinates are one-based, column first, exactly as the
+    terminal sends them.** tui-nv's buffer is zero-based and converts at
+    that boundary. See xterm's `ctlseqs`, "Mouse Tracking".
+11. **The X10 mouse encoding cannot say anything past 223.** A terminal
     reports 223 forever past that column, and `X10_COORD_MAX` is the
     number. `coordinates_are_exact` answers whether a report is
     trustworthy. A program on a wide screen should ask the terminal for
     the SGR encoding, which is `CSI ? 1006 h`.
-11. **Only the SGR encoding distinguishes a press from a release.** Its
+12. **Only the SGR encoding distinguishes a press from a release.** Its
     final byte says which. X10 and urxvt both report a release as button
     3, so which button was let go cannot be recovered.
-12. **A paste arrives as a wrapper and a stream of bytes.**
+13. **A paste arrives as a wrapper and a stream of bytes.**
     `KeyPasteStart`, then one `KeyPasteByte` per byte, then
-    `KeyPasteEnd`. During a paste the decoder is holding nothing and is
-    still not settled, which is what `in_paste` answers.
-13. **A terminal's reply to a query arrives on this stream and is not a
+    `KeyPasteEnd`. During a paste the decoder holds at most the five
+    bytes of a half-arrived end marker, and reports them as pasted text
+    as soon as a byte proves they were not the marker. `in_paste`
+    answers whether a paste is open.
+14. **A terminal's reply to a query arrives on this stream and is not a
     key.** `CSI 12 ; 40 R` is an answer to a cursor position query. This
-    package reports it as `KeyUnknownSequence` rather than guessing;
+    package reports it as `KeyUnknownSequence` rather than guessing, and
+    for that reason it reads no key from a CSI ending in `R`;
     [ansi-nv](https://novo-lang.org/packages/ansi-nv)'s
-    `vtquery.reply_of` is what reads it.
-14. **win32-input-mode is not decoded.** `protocol_supported` answers
+    `vtquery.reply_of` is what reads it. The three function keys xterm
+    spells the same way, `CSI 1 ; <mods> P`, `Q` and `S`, are read.
+15. **win32-input-mode is not decoded.** `protocol_supported` answers
     `false` for it and `protocol_refusal` gives the reason. Its six
     parameters describe a Windows console key event record, with a
     virtual key code and a scan code, and mapping those onto this model
     needs a Windows keyboard-layout table.
-15. **Both ceilings are the caller's.** `sequence_bytes_max` bounds one
+16. **Both ceilings are the caller's.** `sequence_bytes_max` bounds one
     escape sequence, and beyond it the decoder reports
-    `KeyUnknownSequence` and carries on. `kitty_enabled` turns the kitty
-    forms off, for a program running against a terminal it has not
-    negotiated with. `legacy_limits` is that configuration.
+    `KeyUnknownSequence` and reads the bytes that follow as fresh input.
+    `kitty_enabled` turns the kitty forms off, for a program running
+    against a terminal it has not negotiated with. `legacy_limits` is
+    that configuration. A single parameter stops growing at 65535, which
+    is a number no form here claims, so a sequence carrying a longer run
+    of digits is reported by its final byte.
+17. **A key outside the closed set is reported rather than folded.** The
+    kitty protocol names the modifier keys themselves, ten keypad keys
+    that duplicate a named key, and three media keys that `KeyName` has
+    no variant for. A sequence carrying one of those is
+    `KeyUnknownSequence`.
 
 ## Running on a microcontroller
 
-novo-lang lets a package state which of its modules can run on a device
-with no heap allocator, and the compiler checks that claim on every
-build. Here the claim covers the whole package: nothing in it reads,
-waits or consults a clock.
+This package does not build for a device with no heap allocator, and
+`novo build --target=nrf52-qemu` refuses it. The reason is the model
+rather than the decoding. `KeyMods`, `KeyStroke` and `MouseReport` are
+boxed structs, and `KeyPress`, `KeyName`, `KeyPadKey`,
+`MouseButtonKind` and `KeyEvent` each carry a variant with a payload;
+every one of those is a heap cell at that tier, and the compiler refuses
+it where it is written. `KeyDecoder.held` is a `[u8]`, which is a second
+heap cell and would have to become a fixed-capacity buffer —
+[heapless-nv](https://novo-lang.org/packages/heapless-nv)'s.
 
-```bash
-novo build --target=nrf52-qemu tests/embedded_probe.nv
-```
+What a device build would take is therefore a different model: `@value`
+structs, and a discriminant field in place of each payload-carrying
+variant. That is a different published interface, not a change of
+implementation, so it is not something this release can do quietly.
 
-That command builds a Cortex-M4 executable today. A device with a serial
-console takes keystrokes off a UART, and the bytes are the same bytes.
-Its read loop already has a timer, and `flush` is how it hands the
-answer back.
-
-**What links today is the signatures, not the storage.** Every body is a
-`todo()`. `KeyDecoder.held` is a `[u8]` and has to become a
-fixed-capacity buffer —
-[heapless-nv](https://novo-lang.org/packages/heapless-nv)'s — before any
-of it runs on a device.
+Nothing here reads, waits or consults a clock, which is the other half
+of what a firmware needs. A device with a serial console takes
+keystrokes off a UART, and the bytes are the same bytes.
 
 ## What is not included
 
@@ -242,11 +260,14 @@ of it runs on a device.
 - **Reading, timing and raw mode.** All three belong to the host.
   [termios-nv](https://novo-lang.org/packages/termios-nv) has raw mode,
   and the read loop is the program's own.
-- **Query replies.** See rule 13.
-- **win32-input-mode.** See rule 14.
-- **A palette of key names beyond the closed set.** A terminal that
-  sends something outside `KeyName` gets `KeyUnknownSequence`, which is
-  a better answer than an invented variant.
+- **Query replies.** See rule 14.
+- **win32-input-mode.** See rule 15.
+- **A palette of key names beyond the closed set.** See rule 17.
+- **Validation of a codepoint's continuation bytes.** The decoder takes
+  as many bytes as the lead byte promises and reads the low six bits of
+  each. A terminal that sends a byte outside 0x80 to 0xBF there has sent
+  a codepoint no encoder produces.
+- **A build for a device.** See "Running on a microcontroller".
 
 ## Related packages
 
@@ -256,8 +277,7 @@ of it runs on a device.
   package does not depend on it. The input stream is a different state
   machine: the X10 mouse encoding puts three raw bytes after the final
   byte, where a conforming sequence parser has already stopped
-  collecting; the kitty forms carry the key event in a sub-parameter
-  group; and the lone-ESC ambiguity has no counterpart on output.
+  collecting; and the lone-ESC ambiguity has no counterpart on output.
 - [termios-nv](https://novo-lang.org/packages/termios-nv) owns the file
   descriptor. It puts the terminal in raw mode, runs the read, and is
   the party whose timeout drives `flush`.
@@ -275,6 +295,8 @@ of it runs on a device.
 
 ```bash
 novo test --isolate tests/keydecode_tests.nv   # 23 tests: the state machine
+novo test --isolate tests/sequence_tests.nv    # 27 tests: every spelling it reads
+novo test --isolate tests/model_tests.nv       # 16 tests: the two arithmetic modules
 novo test --isolate tests/surface_tests.nv     # 15 tests: every signature, once
 ```
 
@@ -290,34 +312,19 @@ held rather than resolved, a `flush` producing two events out of an
 unfinished `ESC [`, the same keystroke arriving in all three protocols
 and decoding to one value, a modifier parameter of 1 meaning nothing is
 held, an X10 report at the ceiling reported as inexact, and a paste
-staying open across a chunk boundary. `surface_tests.nv` calls every
-published function once, from outside its own module.
+staying open across a chunk boundary.
 
-No test reads a descriptor or consults a clock. The tests compile today
-and fail at run, each on the `not implemented: keymap-nv.<module>.<fn>`
-panic that is its body. That is the expected state of an interface
-release. They turn green one at a time as bodies land.
+`sequence_tests.nv` is one case per spelling: the SS3 keypad, the tilde
+numbers, the kitty protocol's functional key numbers, the three mouse
+encodings with the inputs each of them refuses, the bytes of a
+codepoint, and the sequences that are reported rather than read.
+`model_tests.nv` is the two arithmetic modules, every entry of their
+tables in both directions. `surface_tests.nv` calls every published
+function once, from outside its own module.
 
-`tests/embedded_probe.nv` is the program that shows this package builds
-for a microcontroller with no heap allocator. It is compiled for the
-nRF52 target and either builds or does not. See "Running on a
-microcontroller".
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `keydecode.ESCAPE_TIMEOUT_MS`, `mousedecode.X10_COORD_MAX` | yes (they are constants) |
-| `keymodel.no_mods`, `.mods_of`, `.mods_param`, `.mods_any`, `.mods_eq` | no |
-| `keymodel.stroke_eq`, `.char_key`, `.named_key`, `.ctrl_key`, `.with_mods` | no |
-| `keymodel.control_char`, `.char_of_control` | no |
-| `keydecode.protocol_supported`, `.protocol_refusal` | no |
-| `keydecode.default_limits`, `.legacy_limits`, `.decoder_new`, `.decoder_with` | no |
-| `keydecode.feed_byte`, `.feed`, `.flush`, `.decode_one` | no |
-| `keydecode.is_pending`, `.pending_bytes`, `.in_paste`, `.reset` | no |
-| `mousedecode.decode_button`, `.decode_mods`, `.is_motion`, `.button_code` | no |
-| `mousedecode.report_x10`, `.report_sgr`, `.report_urxvt` | no |
-| `mousedecode.is_wheel`, `.coordinates_are_exact` | no |
+No test reads a descriptor or consults a clock. Every line of `src/` is
+executed by the suites; `bash tests/coverage.sh` measures it and prints
+the number.
 
 ## Licence
 
