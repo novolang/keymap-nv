@@ -1,15 +1,11 @@
-// keydecode_tests.nv — the API suite for the input state machine.
+// keydecode_tests.nv — the behaviour of the input state machine.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: keymap-nv.<module>.<fn>`.
-// Run with `--isolate` for one verdict per `@test`.
-//
-// THE CASES THAT MATTER are the ones about the lone ESC, and they are
-// written as three separate tests on purpose: that `feed_byte` never
-// resolves it, that another byte resolves it one way, and that `flush`
-// resolves it the other.  A decoder that got any one of the three
-// wrong would still pass a suite that only fed complete sequences —
-// which is how the bug ships.
+// The cases that matter are the ones about the lone ESC, and they are
+// three separate tests: that `feed_byte` never resolves it, that
+// another byte resolves it one way, and that `flush` resolves it the
+// other.  A decoder that got any one of the three wrong would still
+// pass a suite that only fed complete sequences, which is how the bug
+// ships.
 //
 // The row on every `@test` here is `[io]`, for `test.case` and nothing
 // else.  A decoder that had needed a clock would have forced `[time]`
@@ -79,7 +75,8 @@ fn test_tab_and_enter_are_keys_rather_than_control_letters() [io]
     // A decoder that applied the control rule blindly reports Tab as
     // Ctrl+I forever.
     test.case("0x09 is Tab")
-    match list.get(run([0x09]).events, 0)
+    let tab = run([0x09])
+    match list.get(tab.events, 0)
         KeyPressed(k) =>
             match k.press
                 KeyNamed(KeyTab) => test.assert(true)
@@ -87,7 +84,8 @@ fn test_tab_and_enter_are_keys_rather_than_control_letters() [io]
         _             => test.assert(false)
 
     test.case("0x0D is Enter")
-    match list.get(run([0x0D]).events, 0)
+    let enter = run([0x0D])
+    match list.get(enter.events, 0)
         KeyPressed(k) =>
             match k.press
                 KeyNamed(KeyEnter) => test.assert(true)
@@ -322,12 +320,14 @@ fn test_an_open_paste_is_not_settled_but_holds_nothing() [io]
 @test
 fn test_focus_events_are_their_own_two_sequences() [io]
     test.case("CSI I is focus gained")
-    match list.get(run([0x1B, 0x5B, 0x49]).events, 0)
+    let gained = run([0x1B, 0x5B, 0x49])
+    match list.get(gained.events, 0)
         KeyFocusGained => test.assert(true)
         _              => test.assert(false)
 
     test.case("and CSI O is focus lost")
-    match list.get(run([0x1B, 0x5B, 0x4F]).events, 0)
+    let lost = run([0x1B, 0x5B, 0x4F])
+    match list.get(lost.events, 0)
         KeyFocusLost => test.assert(true)
         _            => test.assert(false)
 
@@ -363,14 +363,23 @@ fn test_an_x10_mouse_report_carries_three_raw_bytes() [io]
 
 @test
 fn test_an_unrecognised_sequence_is_reported_rather_than_dropped() [io]
-    // `CSI 1 2 3 Z` — a final byte nothing here claims.  A program
+    // `CSI 1 2 3 W` — a final byte nothing here claims.  A program
     // that knows about it has to be able to see it.
-    let out = run([0x1B, 0x5B, 0x31, 0x32, 0x33, 0x5A])
+    let out = run([0x1B, 0x5B, 0x31, 0x32, 0x33, 0x57])
 
     test.case("the final byte comes back")
     match list.get(out.events, 0)
-        KeyUnknownSequence(f) => test.assert(f == 0x5A)
+        KeyUnknownSequence(f) => test.assert(f == 0x57)
         _                     => test.assert(false)
+
+    test.case("while CSI Z is Shift and Tab, which is a key")
+    let backtab = run([0x1B, 0x5B, 0x5A])
+    match list.get(backtab.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyNamed(KeyBackTab) => test.assert(true)
+                _                    => test.assert(false)
+        _             => test.assert(false)
 
 @test
 fn test_a_chunk_boundary_anywhere_changes_nothing() [io]

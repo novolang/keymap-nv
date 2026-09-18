@@ -1,16 +1,12 @@
 // surface_tests.nv — the rest of the published surface, called once
 // each.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: keymap-nv.<module>.<fn>`.
-// Run with `--isolate` for one verdict per `@test`.
-//
-// WHY THIS FILE EXISTS SEPARATELY.  `keydecode_tests.nv` asserts
-// BEHAVIOUR — that a lone ESC stays held, that a flush resolves it.
-// This one asserts that the surface is callable at all: that every
-// published signature type-checks from outside its own module, with
-// the argument types a consumer would pass.  On an interface package
-// that is the product, so it is worth a suite of its own.
+// `keydecode_tests.nv` asserts behaviour: that a lone ESC stays held,
+// that a flush resolves it.  This one asserts that the surface is
+// callable at all, which is that every published signature type-checks
+// from outside its own module, with the argument types a consumer would
+// pass.  A signature a consumer cannot call is a signature no behaviour
+// test reaches, so it is worth a suite of its own.
 
 use std.test
 use std.list

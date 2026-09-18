@@ -1,0 +1,463 @@
+// sequence_tests.nv — one case per spelling the decoder reads.
+//
+// `keydecode_tests.nv` asserts the behaviour of the state machine, and
+// this file asserts its tables: the SS3 keypad, the tilde numbers, the
+// kitty protocol's functional keys, the three mouse encodings, and the
+// bytes of a codepoint.  The vectors are the reference documents' own —
+// xterm's `ctlseqs` for the legacy and modifyOtherKeys forms and the
+// three mouse encodings, and the kitty keyboard protocol for the
+// `CSI u` forms and its functional key numbers.
+//
+// The row on every `@test` is `[io]`, for `test.case` and nothing else.
+
+use std.test
+use std.list
+use keymodel
+use keydecode
+
+// Whether a sequence decodes to one keystroke and that keystroke is the
+// one given.
+//
+// The comparison happens inside the arm that binds the keystroke.  A
+// helper that handed the keystroke back instead would be returning a
+// value bound two patterns deep, which on this toolchain aliases the
+// next call's answer (novo bug
+// memory-perceus/nested-pattern-binding-returned-from-an-arm-aliases-the-next-result).
+fn decodes_to(bytes: [Int], want: keymodel.KeyStroke) -> Bool
+    match keydecode.decode_one(list.map(bytes, b => b as u8),
+                               keydecode.default_limits())
+        Some(KeyPressed(k)) => keymodel.stroke_eq(k, want)
+        _                   => false
+
+// Whether a sequence decodes to a press with nothing held.
+fn press_is(bytes: [Int], expected: keymodel.KeyPress) -> Bool
+    decodes_to(bytes, KeyStroke { press: expected, mods: keymodel.no_mods(),
+                                  motion: KeyDownEvent })
+
+// A keystroke with one set of modifiers and the down motion.
+fn with_param(press: keymodel.KeyPress, param: Int) -> keymodel.KeyStroke
+    KeyStroke { press: press, mods: keymodel.mods_of(param), motion: KeyDownEvent }
+
+// Whether a sequence is reported as one this package does not read.
+fn is_unknown(bytes: [Int], final_byte: Int) -> Bool
+    match keydecode.decode_one(list.map(bytes, b => b as u8),
+                               keydecode.default_limits())
+        Some(KeyUnknownSequence(f)) => f == final_byte
+        _                           => false
+
+// A number as the bytes of its decimal digits.
+fn digits(n: Int) -> [Int]
+    if n < 10
+        [n + '0']
+    else
+        list.push(digits(n / 10), n % 10 + '0')
+
+// `CSI <n> u`, the kitty protocol's form.
+fn csi_u(n: Int) -> [Int]
+    list.concat(list.concat([0x1B, '['], digits(n)), ['u'])
+
+// `CSI <n> ~`, the form the VT220 keys arrive in.
+fn csi_tilde(n: Int) -> [Int]
+    list.concat(list.concat([0x1B, '['], digits(n)), ['~'])
+
+// `ESC O <b>`, which is SS3 and one byte.
+fn ss3(b: Int) -> [Int]
+    [0x1B, 'O', b]
+
+// Every event a chunk produces, from a fresh decoder.
+fn run(bytes: [Int]) -> keydecode.KeyDrained
+    keydecode.feed(keydecode.decoder_new(), list.map(bytes, b => b as u8))
+
+@test
+fn test_a_codepoint_arrives_as_its_utf8_bytes() [io]
+    test.case("two bytes, which is é")
+    test.assert(press_is([0xC3, 0xA9], KeyChar(0xE9)))
+
+    test.case("three bytes, which is the euro sign")
+    test.assert(press_is([0xE2, 0x82, 0xAC], KeyChar(0x20AC)))
+
+    test.case("four bytes, which is an emoji")
+    test.assert(press_is([0xF0, 0x9F, 0x98, 0x80], KeyChar(0x1F600)))
+
+    test.case("and a byte that leads no codepoint is a character of its own")
+    test.assert(press_is([0x80], KeyChar(0x80)))
+
+@test
+fn test_a_codepoint_split_across_reads_is_held() [io]
+    let first = run([0xC3])
+
+    test.case("the lead byte alone produces nothing and is held")
+    test.assert(list.len(first.events) == 0)
+    test.assert(keydecode.pending_bytes(first.decoder) == 1)
+
+    test.case("the continuation byte completes it")
+    let second = keydecode.feed(first.decoder, [0xA9 as u8])
+    test.assert(list.len(second.events) == 1)
+
+    test.case("and a flush turns a lead byte that never completed into a character")
+    let flushed = keydecode.flush(first.decoder)
+    test.assert(list.len(flushed.events) == 1)
+    match list.get(flushed.events, 0)
+        KeyPressed(k) =>
+            match k.press
+                KeyChar(c) => test.assert(c == 0xC3)
+                _          => test.assert(false)
+        _             => test.assert(false)
+
+@test
+fn test_alt_and_a_codepoint() [io]
+    test.case("an ESC in front of a codepoint is the alt prefix")
+    test.assert(decodes_to([0x1B, 0xC3, 0xA9], with_param(KeyChar(0xE9), 3)))
+
+@test
+fn test_two_escapes_are_an_alt_prefix_and_a_sequence() [io]
+    let two = run([0x1B, 0x1B])
+
+    test.case("two escapes alone are still ambiguous")
+    test.assert(list.len(two.events) == 0)
+    test.assert(keydecode.pending_bytes(two.decoder) == 2)
+
+    test.case("and with an arrow behind them it is Alt and the arrow")
+    test.assert(decodes_to([0x1B, 0x1B, 0x5B, 'A'], with_param(KeyNamed(KeyUp), 3)))
+    test.assert(press_is([0x1B, 0x1B, 0x5B, 'A'], KeyNamed(KeyUp)) == false)
+
+@test
+fn test_the_ss3_forms_name_the_function_keys_and_the_arrows() [io]
+    test.case("ESC O P to ESC O S are F1 to F4")
+    test.assert(press_is(ss3('P'), KeyNamed(KeyFunction(1))))
+    test.assert(press_is(ss3('S'), KeyNamed(KeyFunction(4))))
+
+    test.case("the four arrows")
+    test.assert(press_is(ss3('A'), KeyNamed(KeyUp)))
+    test.assert(press_is(ss3('B'), KeyNamed(KeyDown)))
+    test.assert(press_is(ss3('C'), KeyNamed(KeyRight)))
+    test.assert(press_is(ss3('D'), KeyNamed(KeyLeft)))
+
+    test.case("Home and End")
+    test.assert(press_is(ss3('H'), KeyNamed(KeyHome)))
+    test.assert(press_is(ss3('F'), KeyNamed(KeyEnd)))
+
+@test
+fn test_the_ss3_forms_name_the_keypad() [io]
+    test.case("the ten digits, which are ESC O p to ESC O y")
+    test.assert(press_is(ss3('p'), KeyPad(KeyPadDigit(0))))
+    test.assert(press_is(ss3('y'), KeyPad(KeyPadDigit(9))))
+
+    test.case("the five operators")
+    test.assert(press_is(ss3('j'), KeyPad(KeyPadStar)))
+    test.assert(press_is(ss3('k'), KeyPad(KeyPadPlus)))
+    test.assert(press_is(ss3('m'), KeyPad(KeyPadMinus)))
+    test.assert(press_is(ss3('n'), KeyPad(KeyPadDot)))
+    test.assert(press_is(ss3('o'), KeyPad(KeyPadSlash)))
+
+    test.case("the keypad's own Enter and its equals key")
+    test.assert(press_is(ss3('M'), KeyPad(KeyPadEnter)))
+    test.assert(press_is(ss3('X'), KeyPad(KeyPadEqual)))
+
+    test.case("keypad 5 with NumLock off, which is ESC O E")
+    test.assert(press_is(ss3('E'), KeyPad(KeyPadBegin)))
+
+    test.case("and a byte SS3 does not name")
+    test.assert(is_unknown(ss3('z'), 'z'))
+
+@test
+fn test_the_csi_forms_name_the_same_keys() [io]
+    test.case("Home, End and keypad 5")
+    test.assert(press_is([0x1B, '[', 'H'], KeyNamed(KeyHome)))
+    test.assert(press_is([0x1B, '[', 'F'], KeyNamed(KeyEnd)))
+    test.assert(press_is([0x1B, '[', 'E'], KeyPad(KeyPadBegin)))
+
+    test.case("F1, F2 and F4, which xterm spells with a letter")
+    test.assert(press_is([0x1B, '[', 'P'], KeyNamed(KeyFunction(1))))
+    test.assert(press_is([0x1B, '[', 'Q'], KeyNamed(KeyFunction(2))))
+    test.assert(press_is([0x1B, '[', 'S'], KeyNamed(KeyFunction(4))))
+
+    test.case("the three arrows the keydecode suite does not name")
+    test.assert(press_is([0x1B, '[', 'B'], KeyNamed(KeyDown)))
+    test.assert(press_is([0x1B, '[', 'C'], KeyNamed(KeyRight)))
+    test.assert(press_is([0x1B, '[', 'D'], KeyNamed(KeyLeft)))
+
+    test.case("and CSI R is the reply to a cursor position query, not F3")
+    test.assert(is_unknown([0x1B, '[', '1', '2', ';', '4', '0', 'R'], 'R'))
+
+@test
+fn test_the_tilde_numbers_name_the_vt220_keys() [io]
+    test.case("the six editing keys, and the two spellings of Home and End")
+    test.assert(press_is(csi_tilde(1), KeyNamed(KeyHome)))
+    test.assert(press_is(csi_tilde(7), KeyNamed(KeyHome)))
+    test.assert(press_is(csi_tilde(2), KeyNamed(KeyInsert)))
+    test.assert(press_is(csi_tilde(3), KeyNamed(KeyDelete)))
+    test.assert(press_is(csi_tilde(4), KeyNamed(KeyEnd)))
+    test.assert(press_is(csi_tilde(8), KeyNamed(KeyEnd)))
+    test.assert(press_is(csi_tilde(5), KeyNamed(KeyPageUp)))
+    test.assert(press_is(csi_tilde(6), KeyNamed(KeyPageDown)))
+
+@test
+fn test_the_tilde_numbers_name_the_function_keys() [io]
+    test.case("the five runs, at both ends of each")
+    test.assert(press_is(csi_tilde(11), KeyNamed(KeyFunction(1))))
+    test.assert(press_is(csi_tilde(15), KeyNamed(KeyFunction(5))))
+    test.assert(press_is(csi_tilde(17), KeyNamed(KeyFunction(6))))
+    test.assert(press_is(csi_tilde(21), KeyNamed(KeyFunction(10))))
+    test.assert(press_is(csi_tilde(23), KeyNamed(KeyFunction(11))))
+    test.assert(press_is(csi_tilde(26), KeyNamed(KeyFunction(14))))
+    test.assert(press_is(csi_tilde(28), KeyNamed(KeyFunction(15))))
+    test.assert(press_is(csi_tilde(29), KeyNamed(KeyFunction(16))))
+    test.assert(press_is(csi_tilde(31), KeyNamed(KeyFunction(17))))
+    test.assert(press_is(csi_tilde(34), KeyNamed(KeyFunction(20))))
+
+    test.case("and a number in one of the gaps names no key")
+    test.assert(is_unknown(csi_tilde(9), '~'))
+    test.assert(is_unknown(csi_tilde(16), '~'))
+
+@test
+fn test_a_tilde_form_carries_its_modifier() [io]
+    test.case("CSI 3 ; 5 ~ is Ctrl and Delete")
+    test.assert(decodes_to([0x1B, '[', '3', ';', '5', '~'],
+                           with_param(KeyNamed(KeyDelete), 5)))
+
+    test.case("and a parameter the sequence left empty is an absence")
+    test.assert(is_unknown([0x1B, '[', ';', '5', '~'], '~'))
+
+@test
+fn test_the_kitty_forms_name_the_four_keys_that_have_a_name() [io]
+    test.case("Enter, Tab, Escape and Backspace arrive by their codepoint")
+    test.assert(press_is(csi_u(13), KeyNamed(KeyEnter)))
+    test.assert(press_is(csi_u(9), KeyNamed(KeyTab)))
+    test.assert(press_is(csi_u(27), KeyNamed(KeyEscape)))
+    test.assert(press_is(csi_u(127), KeyNamed(KeyBackspace)))
+
+    test.case("and any other codepoint is the character it types")
+    test.assert(press_is(csi_u(97), KeyChar('a')))
+
+@test
+fn test_the_kitty_forms_name_the_functional_keys() [io]
+    test.case("the six keys from 57358 to 57363")
+    test.assert(press_is(csi_u(57358), KeyNamed(KeyCapsLock)))
+    test.assert(press_is(csi_u(57359), KeyNamed(KeyScrollLock)))
+    test.assert(press_is(csi_u(57360), KeyNamed(KeyNumLock)))
+    test.assert(press_is(csi_u(57361), KeyNamed(KeyPrintScreen)))
+    test.assert(press_is(csi_u(57362), KeyNamed(KeyPause)))
+    test.assert(press_is(csi_u(57363), KeyNamed(KeyMenu)))
+
+    test.case("F13 to F35, which no legacy form can say")
+    test.assert(press_is(csi_u(57376), KeyNamed(KeyFunction(13))))
+    test.assert(press_is(csi_u(57398), KeyNamed(KeyFunction(35))))
+
+@test
+fn test_the_kitty_forms_name_the_keypad() [io]
+    test.case("the ten digits")
+    test.assert(press_is(csi_u(57399), KeyPad(KeyPadDigit(0))))
+    test.assert(press_is(csi_u(57408), KeyPad(KeyPadDigit(9))))
+
+    test.case("the seven keys after them")
+    test.assert(press_is(csi_u(57409), KeyPad(KeyPadDot)))
+    test.assert(press_is(csi_u(57410), KeyPad(KeyPadSlash)))
+    test.assert(press_is(csi_u(57411), KeyPad(KeyPadStar)))
+    test.assert(press_is(csi_u(57412), KeyPad(KeyPadMinus)))
+    test.assert(press_is(csi_u(57413), KeyPad(KeyPadPlus)))
+    test.assert(press_is(csi_u(57414), KeyPad(KeyPadEnter)))
+    test.assert(press_is(csi_u(57415), KeyPad(KeyPadEqual)))
+
+    test.case("and keypad 5 with NumLock off")
+    test.assert(press_is(csi_u(57427), KeyPad(KeyPadBegin)))
+
+@test
+fn test_the_kitty_forms_name_the_media_keys() [io]
+    test.case("the five media keys this model has a name for")
+    test.assert(press_is(csi_u(57428), KeyNamed(KeyMediaPlay)))
+    test.assert(press_is(csi_u(57429), KeyNamed(KeyMediaPauseKey)))
+    test.assert(press_is(csi_u(57432), KeyNamed(KeyMediaStop)))
+    test.assert(press_is(csi_u(57435), KeyNamed(KeyMediaNext)))
+    test.assert(press_is(csi_u(57436), KeyNamed(KeyMediaPrev)))
+
+    test.case("and the three volume keys")
+    test.assert(press_is(csi_u(57438), KeyNamed(KeyVolumeDown)))
+    test.assert(press_is(csi_u(57439), KeyNamed(KeyVolumeUp)))
+    test.assert(press_is(csi_u(57440), KeyNamed(KeyVolumeMute)))
+
+@test
+fn test_a_kitty_key_outside_the_closed_set_is_reported_rather_than_folded() [io]
+    test.case("the modifier keys themselves have no variant here")
+    test.assert(is_unknown(csi_u(57441), 'u'))
+
+    test.case("nor do the keypad keys that duplicate a named key")
+    test.assert(is_unknown(csi_u(57417), 'u'))
+
+    test.case("nor the numbers the protocol has not assigned")
+    test.assert(is_unknown(csi_u(57344), 'u'))
+
+@test
+fn test_the_kitty_event_type_says_which_way_the_key_went() [io]
+    test.case("2 is a repeat")
+    test.assert(decodes_to([0x1B, '[', '9', '9', ';', '1', ':', '2', 'u'],
+                           KeyStroke { press: KeyChar('c'), mods: keymodel.no_mods(),
+                                       motion: KeyRepeatEvent }))
+
+    test.case("and a form with no event type is a press")
+    test.assert(press_is(csi_u(99), KeyChar('c')))
+
+@test
+fn test_the_urxvt_mouse_encoding_comes_through_the_stream() [io]
+    test.case("three parameters and the final byte M")
+    let out = run([0x1B, '[', '3', '2', ';', '4', '0', ';', '1', '2', 'M'])
+    match list.get(out.events, 0)
+        KeyMouse(r) =>
+            test.assert(r.col == 40)
+            test.assert(r.row == 12)
+        _           => test.assert(false)
+
+    test.case("a first parameter below the offset is not a report")
+    test.assert(is_unknown([0x1B, '[', '1', ';', '4', '0', ';', '1', '2', 'M'], 'M'))
+
+    test.case("and a final M with fewer than three parameters names no key")
+    test.assert(is_unknown([0x1B, '[', '3', '2', 'M'], 'M'))
+
+@test
+fn test_a_mouse_report_the_encodings_cannot_carry_is_reported() [io]
+    test.case("an X10 report with a byte below the offset")
+    test.assert(is_unknown([0x1B, '[', 'M', 0x20, 0x48, 0x0A], 'M'))
+
+    test.case("an SGR sequence whose final byte says neither press nor release")
+    test.assert(is_unknown([0x1B, '[', '<', '0', ';', '4', '0', ';', '1', '2', 'X'], 'X'))
+
+    test.case("and a private marker this package does not read")
+    test.assert(is_unknown([0x1B, '[', '?', 'M'], 'M'))
+
+@test
+fn test_an_sgr_release_names_the_button_it_let_go() [io]
+    test.case("the lower-case final byte")
+    let out = run([0x1B, '[', '<', '0', ';', '4', '0', ';', '1', '2', 'm'])
+    match list.get(out.events, 0)
+        KeyMouse(r) =>
+            match r.action
+                MouseReleased => test.assert(true)
+                _             => test.assert(false)
+            match r.button
+                MouseLeft => test.assert(true)
+                _         => test.assert(false)
+        _           => test.assert(false)
+
+@test
+fn test_a_paste_carries_the_bytes_a_sequence_is_made_of() [io]
+    // `CSI 200 ~`, then an ESC that is pasted text rather than the end
+    // marker, then `CSI 201 ~`.
+    let out = run([0x1B, '[', '2', '0', '0', '~',
+                   0x1B, 'x',
+                   0x1B, '[', '2', '0', '1', '~'])
+
+    test.case("every pasted byte is reported, in order")
+    test.assert(list.len(out.events) == 4)
+    match list.get(out.events, 1)
+        KeyPasteByte(b) => test.assert(b == 0x1B)
+        _               => test.assert(false)
+    match list.get(out.events, 2)
+        KeyPasteByte(b) => test.assert(b == 'x')
+        _               => test.assert(false)
+
+    test.case("and the paste is closed")
+    test.assert(keydecode.in_paste(out.decoder) == false)
+
+@test
+fn test_a_flush_inside_a_paste_reports_the_bytes_it_was_holding() [io]
+    let out = run([0x1B, '[', '2', '0', '0', '~', 0x1B, '['])
+
+    test.case("the two bytes could still have been the end marker, so they are held")
+    test.assert(keydecode.pending_bytes(out.decoder) == 2)
+
+    let flushed = keydecode.flush(out.decoder)
+
+    test.case("a flush reports them as pasted text")
+    test.assert(list.len(flushed.events) == 2)
+    match list.get(flushed.events, 0)
+        KeyPasteByte(b) => test.assert(b == 0x1B)
+        _               => test.assert(false)
+
+    test.case("and the paste is still open, because nothing closed it")
+    test.assert(keydecode.in_paste(flushed.decoder))
+
+@test
+fn test_an_end_marker_with_no_paste_open_is_still_the_end_marker() [io]
+    // A terminal that sends `CSI 201 ~` without having sent `CSI 200 ~`
+    // has ended a paste this decoder never saw begin.  The sequence is
+    // what it is, and reporting it is more useful than dropping it.
+    test.case("the end of a paste nothing opened")
+    let out = run([0x1B, '[', '2', '0', '1', '~'])
+    test.assert(list.len(out.events) == 1)
+    match list.get(out.events, 0)
+        KeyPasteEnd => test.assert(true)
+        _           => test.assert(false)
+
+    test.case("and the decoder was never in a paste")
+    test.assert(keydecode.in_paste(out.decoder) == false)
+
+@test
+fn test_a_reset_closes_an_open_paste() [io]
+    let out = run([0x1B, '[', '2', '0', '0', '~'])
+
+    test.case("the paste is open")
+    test.assert(keydecode.in_paste(out.decoder))
+
+    test.case("and a reset closes it")
+    test.assert(keydecode.in_paste(keydecode.reset(out.decoder)) == false)
+
+@test
+fn test_a_sequence_past_the_ceiling_is_reported_and_dropped() [io]
+    // `CSI` and seventy digits, which is past the 64-byte ceiling
+    // `default_limits` sets, and then an arrow's final byte.
+    let ones = list.map(list.range(0, 70), _ => '1')
+    let out = run(list.concat(list.concat([0x1B, '['], ones), ['A']))
+
+    test.case("the decoder gives up on it at the ceiling rather than growing")
+    match list.get(out.events, 0)
+        KeyUnknownSequence(f) => test.assert(f == '1')
+        _                     => test.assert(false)
+    test.assert(keydecode.is_pending(out.decoder) == false)
+
+    test.case("and the bytes past the ceiling are read as fresh input")
+    let last = list.len(out.events) - 1
+    match list.get(out.events, last)
+        KeyPressed(k) => test.assert(keymodel.stroke_eq(k, keymodel.char_key('A')))
+        _             => test.assert(false)
+
+@test
+fn test_decode_one_takes_one_whole_sequence_and_nothing_else() [io]
+    test.case("no bytes at all is not a sequence")
+    match keydecode.decode_one([], keydecode.default_limits())
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("two sequences at once are not one sequence")
+    match keydecode.decode_one([0x71 as u8, 0x72 as u8], keydecode.default_limits())
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and an unrecognised sequence is still an answer")
+    test.assert(is_unknown([0x1B, '[', '1', '2', '3', 'W'], 'W'))
+
+@test
+fn test_the_package_names_the_protocol_it_refuses() [io]
+    test.case("every form it reads is supported")
+    test.assert(keydecode.protocol_supported(KeyLegacyForms))
+    test.assert(keydecode.protocol_supported(KeyModifyOtherKeys))
+    test.assert(keydecode.protocol_supported(KeyKittyKeyboard))
+
+    test.case("and the one it does not carries its reason")
+    test.assert(keydecode.protocol_supported(KeyWin32Input) == false)
+    match keydecode.protocol_refusal(KeyWin32Input)
+        Some(reason) => test.assert(str.len(reason) > 0)
+        None         => test.assert(false)
+
+@test
+fn test_backspace_and_the_bytes_around_it() [io]
+    test.case("0x7F is Backspace")
+    test.assert(press_is([0x7F], KeyNamed(KeyBackspace)))
+
+    test.case("0x08 is Ctrl and h, which is the byte a terminal sends for it")
+    test.assert(decodes_to([0x08], with_param(KeyChar('h'), 5)))
+
+    test.case("0x00 is Ctrl and the space")
+    test.assert(decodes_to([0x00], with_param(KeyChar(' '), 5)))
+
+    test.case("and Alt and Backspace is the escape prefix in front of it")
+    test.assert(decodes_to([0x1B, 0x7F], with_param(KeyNamed(KeyBackspace), 3)))
