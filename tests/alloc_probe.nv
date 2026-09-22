@@ -1,0 +1,207 @@
+// tests/alloc_probe.nv — a program that reaches every function in
+// `keymodel`, `mousedecode` and `keydecode`, so the emitted LLVM can be
+// read for a call to the allocator.
+//
+// This is not a test.  `tests/alloc_scan.sh` builds it with `--opt=0`
+// and reads the IR; `--opt=0` is what makes the check mean anything,
+// because at the default optimisation level the whole probe inlines
+// into `novo_main`, there is no function left to attribute an
+// allocation to, and an assertion that no decoder function allocates
+// would pass because no decoder function is there.
+//
+// Every function is called, because a function the probe never reaches
+// is one the linker drops and the scan never sees.  The `keychunk`
+// module is not here.  It allocates, which is what it is for: a list of
+// events out of a chunk.
+//
+// The probe itself holds its byte vectors in lists and prints a number.
+// That is the caller's allocation and not the decoder's, and the scan
+// reads the decoder's functions by name rather than the whole file.
+// The numbers are printed rather than checked; the suites own
+// correctness.  This one is here to be read as text.
+
+use std.str
+use std.list
+use keymodel
+use mousedecode
+use keydecode
+
+// Every keystroke and modifier the model can build, and both
+// directions of both tables.
+fn model_path() -> Int
+    var score = keymodel.mods_param(keymodel.no_mods())
+    for p in 0..40
+        let m = keymodel.mods_of(p)
+        score = score + keymodel.mods_param(m)
+        if keymodel.mods_any(m)
+            score = score + 1
+        if keymodel.mods_eq(m, keymodel.no_mods())
+            score = score + 1
+    for c in 0..128
+        score = score + keymodel.control_char(c) + keymodel.char_of_control(c)
+    score = score + keymodel.char_key('q').press.codepoint
+    score = score + keymodel.ctrl_key('c').press.codepoint
+    score = score + keymodel.named_key(keymodel.KEY_HOME).press.name
+    score = score + keymodel.no_stroke().press.kind
+    score = score + keymodel.no_press().kind
+    score = score + keymodel.key_char('a').codepoint
+    score = score + keymodel.key_named(keymodel.KEY_END).name
+    score = score + keymodel.key_function(7).number
+    score = score + keymodel.key_pad(keymodel.KEYPAD_PLUS).pad
+    score = score + keymodel.key_pad_digit(3).number
+    if keymodel.press_eq(keymodel.key_char('a'), keymodel.key_char('a'))
+        score = score + 1
+    let up = keymodel.named_key(keymodel.KEY_UP)
+    if keymodel.stroke_eq(up, keymodel.with_mods(up, keymodel.mods_of(5)))
+        score = score + 1
+    score
+
+// Every field of the button byte, and the three encodings with the
+// inputs each of them refuses.
+fn mouse_path() -> Int
+    var score = 0
+    for code in 0..256
+        score = score + mousedecode.decode_button(code)
+        score = score + mousedecode.decode_button_number(code)
+        score = score + mousedecode.button_code(mousedecode.decode_button(code),
+                                                mousedecode.decode_button_number(code),
+                                                mousedecode.decode_mods(code),
+                                                mousedecode.is_motion(code))
+        let r = mousedecode.report_x10(code, 0x48, 0x2C)
+        if mousedecode.is_report(r)
+            score = score + r.col + r.row + r.action + r.encoding
+            if mousedecode.is_wheel(r)
+                score = score + 1
+            if mousedecode.coordinates_are_exact(r)
+                score = score + 1
+        let s = mousedecode.report_sgr(code, code, code, (if code % 2 == 0 then 'M' else 'm'))
+        if mousedecode.is_report(s)
+            score = score + s.button_number + s.action
+        let u = mousedecode.report_urxvt(code, code, code)
+        if mousedecode.is_report(u)
+            score = score + u.col
+    score = score + mousedecode.no_report().encoding
+    score = score + mousedecode.report_sgr(0, 1, 1, 'X').encoding
+    score = score + mousedecode.report_x10(0, 0, 0).encoding
+    score = score + mousedecode.report_urxvt(0, 0, 0).encoding
+    score + mousedecode.X10_COORD_MAX
+
+// One run of bytes through a decoder, byte at a time, then flushed to
+// the end.
+fn drive(limits: keydecode.KeyLimits, bytes: [Int]) -> Int
+    var d = keydecode.decoder_with(limits)
+    var score = 0
+    for b in bytes
+        let step = keydecode.feed_byte(d, b)
+        d = step.decoder
+        score = score + step.event.kind + step.event.byte
+        score = score + step.event.stroke.press.codepoint + step.event.stroke.press.name
+        score = score + step.event.stroke.press.pad + step.event.stroke.press.number
+        score = score + step.event.stroke.motion + step.event.mouse.col
+        if keydecode.in_paste(d)
+            score = score + 1
+        if keydecode.is_pending(d)
+            score = score + keydecode.pending_bytes(d)
+        if d.held.len > 0
+            score = score + keydecode.held_at(d.held, 0)
+    while keydecode.is_pending(d)
+        let step = keydecode.flush_step(d)
+        d = step.decoder
+        score = score + step.event.kind + step.event.stroke.press.codepoint
+    score + keydecode.pending_bytes(keydecode.reset(d))
+
+// Every spelling the decoder reads, driven through the state machine.
+fn decode_path() -> Int
+    var score = keydecode.ESCAPE_TIMEOUT_MS + keydecode.SEQUENCE_BYTES_CAP
+    score = score + keydecode.held_new().len + keydecode.no_event().kind
+    score = score + keydecode.pressed_event(keymodel.char_key('q')).kind
+    score = score + keydecode.mouse_event(mousedecode.no_report()).kind
+    score = score + keydecode.marker_event(keydecode.KEY_EVENT_PASTE_END).kind
+    score = score + keydecode.byte_event(keydecode.KEY_EVENT_PASTE_BYTE, 3).byte
+    score = score + keydecode.decoder_new().limits.sequence_bytes_max
+    for p in 0..4
+        if keydecode.protocol_supported(p)
+            score = score + 1
+        score = score + str.len(keydecode.protocol_refusal(p))
+    let full = keydecode.default_limits()
+    let legacy = keydecode.legacy_limits()
+    // The ground state: characters, control bytes, the three keys that
+    // are keys rather than control letters, and a codepoint.
+    score = score + drive(full, [0x71, 0x03, 0x09, 0x0D, 0x7F, 0x00, 0x1C])
+    score = score + drive(full, [0xC3, 0xA9, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80])
+    score = score + drive(full, [0x80, 0xC3])
+    // The escape prefix, and the lone ESC a flush resolves.
+    score = score + drive(full, [0x1B])
+    score = score + drive(full, [0x1B, 0x1B])
+    score = score + drive(full, [0x1B, 'x'])
+    score = score + drive(full, [0x1B, 0x1B, '[', 'A'])
+    score = score + drive(full, [0x1B, '['])
+    score = score + drive(full, [0xF0, 0x1B, 'x'])
+    score = score + drive(full, [0x1B, 0xC3, 0xA9])
+    // SS3: the function keys, the arrows, Home and End, and the keypad.
+    for b in 0..128
+        score = score + drive(full, [0x1B, 'O', b])
+    // CSI: the letters, the tilde numbers, the kitty numbers.
+    for b in 0..128
+        score = score + drive(full, [0x1B, '[', b])
+    for n in 0..40
+        score = score + drive(full, csi_number(n, '~'))
+        score = score + drive(full, csi_number(n, 'u'))
+    for n in 57340..57445
+        score = score + drive(full, csi_number(n, 'u'))
+        score = score + drive(legacy, csi_number(n, 'u'))
+    // Modifiers, sub-parameters and the forms that carry both.
+    score = score + drive(full, [0x1B, '[', '1', ';', '5', 'A'])
+    score = score + drive(full, [0x1B, '[', '2', '7', ';', '6', ';', '9', '9', '~'])
+    score = score + drive(full, [0x1B, '[', '9', '9', ';', '1', ':', '3', 'u'])
+    score = score + drive(full, [0x1B, '[', ';', '5', '~'])
+    score = score + drive(full, [0x1B, '[', '1', '1', '1', '1', '1', '1', '1', '~'])
+    // The three mouse encodings through the stream.
+    score = score + drive(full, [0x1B, '[', 'M', 0x20, 0x48, 0x2C])
+    score = score + drive(full, [0x1B, '[', 'M', 0x20, 0x48, 0x0A])
+    score = score + drive(full, [0x1B, '[', 'M', 0x20])
+    score = score + drive(full, [0x1B, '[', '<', '0', ';', '4', '0', ';', '1', '2', 'M'])
+    score = score + drive(full, [0x1B, '[', '<', '0', ';', '4', '0', ';', '1', '2', 'm'])
+    score = score + drive(full, [0x1B, '[', '<', '0', ';', '4', '0', ';', '1', '2', 'X'])
+    score = score + drive(full, [0x1B, '[', '3', '2', ';', '4', '0', ';', '1', '2', 'M'])
+    score = score + drive(full, [0x1B, '[', '1', ';', '4', '0', ';', '1', '2', 'M'])
+    score = score + drive(full, [0x1B, '[', '?', 'M'])
+    // A bracketed paste, its end marker half-arrived, and a flush
+    // inside one.
+    score = score + drive(full, [0x1B, '[', '2', '0', '0', '~', 'A',
+                                 0x1B, '[', '2', '0', '1', '~'])
+    score = score + drive(full, [0x1B, '[', '2', '0', '0', '~', 0x1B, 'x',
+                                 0x1B, '[', '2', '0', '1', '~'])
+    score = score + drive(full, [0x1B, '[', '2', '0', '0', '~', 0x1B, '['])
+    // The ceilings, at both ends of the clamp.
+    score = score + drive(KeyLimits { sequence_bytes_max: 0, kitty_enabled: true },
+                          [0x1B, '[', '1', ';', '5', 'A'])
+    score = score + drive(KeyLimits { sequence_bytes_max: 4096, kitty_enabled: true },
+                          long_sequence())
+    score + drive(KeyLimits { sequence_bytes_max: 4, kitty_enabled: true },
+                  [0x1B, '[', '1', ';', '5', 'A'])
+
+// `CSI <n> <final>`, built from the digits of `n`.
+fn csi_number(n: Int, final_byte: Int) -> [Int]
+    list.push(list.concat([0x1B, '['], digits(n)), final_byte)
+
+// A number as the bytes of its decimal digits.
+fn digits(n: Int) -> [Int]
+    if n < 10
+        [n + '0']
+    else
+        list.push(digits(n / 10), n % 10 + '0')
+
+// Twenty-eight bytes, which is what reaches the fourth word of the
+// held buffer.
+fn long_sequence() -> [Int]
+    let param = list.map(list.range(0, 5), d => '6' - d)
+    var seq = [0x1B, 0x1B, 0x1B, 0x1B, 0x1B, 0x1B, 0x1B, 0x1B, '[', '<']
+    for group in 0..3
+        seq = list.concat(seq, param)
+        if group < 2
+            seq = list.push(seq, ';')
+    list.push(seq, 'M')
+
+fn main() [io]
+    println(str.from_int(model_path() + mouse_path() + decode_path()))

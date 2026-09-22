@@ -1,0 +1,119 @@
+// tests/embedded_probe.nv — the decoder on a microcontroller, as a
+// program that builds for a Cortex-M, boots there and checks its
+// answers.
+//
+// This file and the modules its `use` lines reach are built with
+//
+//   novo build --target=nrf52-qemu tests/embedded_probe.nv
+//
+// which produces a Cortex-M4 ELF or fails.  The build checks something
+// the run cannot: `--target=nrf52-qemu` stamps `@tier(embedded)` on
+// every function it compiles, so a list, a heap struct literal or an
+// optional payload is refused wherever it is written, in a function the
+// probe calls and in one it does not.  That is why the three modules
+// here hold their values in `@value` structs and their bytes in a
+// fixed-capacity buffer.
+//
+// The same ELF boots under
+//
+//   qemu-system-arm -machine mps2-an386 -nographic -semihosting -kernel probe.elf
+//
+// and writes `ok` for each of the four things it checks: a control
+// sequence with a modifier, a mouse report, a character outside ASCII,
+// and the lone ESC that only a flush resolves.
+//
+// `keychunk` is not used here.  It answers lists, a device build does
+// not admit one, and a module a device build reaches is a module every
+// function of which is checked.
+//
+// Each step is bound with its type written out because a call into
+// another module does not have its return type inferred in a
+// single-file build.  Inside a package built as one unit — which is
+// what every host suite does — none of these annotations is needed.
+
+use keydecode
+use keymodel
+use mousedecode
+
+fn say(label: Str, good: Bool) [hw]
+    hal.uart.write(label)
+    if good
+        hal.uart.write(": ok\n")
+    else
+        hal.uart.write(": BAD\n")
+
+fn main() [hw]
+    // ── a control sequence with a modifier ──────────────────────────
+    //
+    // `ESC [ 1 ; 5 A` is Ctrl and the up arrow.  Five of the six bytes
+    // complete nothing and leave the decoder holding; the sixth
+    // answers the keystroke.
+    var s: KeyStep = keydecode.feed_byte(keydecode.decoder_new(), 0x1B)
+    var held: Bool = keydecode.is_pending(s.decoder)
+    s = keydecode.feed_byte(s.decoder, '[')
+    s = keydecode.feed_byte(s.decoder, '1')
+    s = keydecode.feed_byte(s.decoder, ';')
+    s = keydecode.feed_byte(s.decoder, '5')
+    s = keydecode.feed_byte(s.decoder, 'A')
+    var good: Bool = held and s.event.kind == keydecode.KEY_EVENT_PRESSED
+    good = good and s.event.stroke.press.kind == keymodel.KEY_PRESS_NAMED
+    good = good and s.event.stroke.press.name == keymodel.KEY_UP
+    good = good and s.event.stroke.mods.ctrl
+    good = good and s.event.stroke.mods.shift == false
+    good = good and keydecode.is_pending(s.decoder) == false
+    say("arrow", good)
+
+    // ── a mouse report ──────────────────────────────────────────────
+    //
+    // `ESC [ < 0 ; 40 ; 12 M` is the left button pressed at column 40,
+    // row 12, in the SGR encoding, which is the one a program should
+    // ask its terminal for.
+    s = keydecode.feed_byte(keydecode.decoder_new(), 0x1B)
+    s = keydecode.feed_byte(s.decoder, '[')
+    s = keydecode.feed_byte(s.decoder, '<')
+    s = keydecode.feed_byte(s.decoder, '0')
+    s = keydecode.feed_byte(s.decoder, ';')
+    s = keydecode.feed_byte(s.decoder, '4')
+    s = keydecode.feed_byte(s.decoder, '0')
+    s = keydecode.feed_byte(s.decoder, ';')
+    s = keydecode.feed_byte(s.decoder, '1')
+    s = keydecode.feed_byte(s.decoder, '2')
+    s = keydecode.feed_byte(s.decoder, 'M')
+    good = s.event.kind == keydecode.KEY_EVENT_MOUSE
+    good = good and s.event.mouse.button == mousedecode.MOUSE_LEFT
+    good = good and s.event.mouse.action == mousedecode.MOUSE_PRESSED
+    good = good and s.event.mouse.col == 40 and s.event.mouse.row == 12
+    good = good and s.event.mouse.encoding == mousedecode.MOUSE_SGR_ENCODING
+    good = good and mousedecode.coordinates_are_exact(s.event.mouse)
+    say("mouse", good)
+
+    // ── a character outside ASCII ───────────────────────────────────
+    //
+    // `é` is the two bytes 0xC3 0xA9, and the lead byte is held until
+    // the continuation byte arrives, exactly as a sequence's bytes are.
+    s = keydecode.feed_byte(keydecode.decoder_new(), 0xC3)
+    held = keydecode.is_pending(s.decoder) and s.event.kind == keydecode.KEY_EVENT_NONE
+    s = keydecode.feed_byte(s.decoder, 0xA9)
+    good = held and s.event.kind == keydecode.KEY_EVENT_PRESSED
+    good = good and s.event.stroke.press.kind == keymodel.KEY_PRESS_CHAR
+    good = good and s.event.stroke.press.codepoint == 0xE9
+    good = good and keydecode.pending_bytes(s.decoder) == 0
+    say("utf8", good)
+
+    // ── a lone ESC, and the flush that resolves it ──────────────────
+    //
+    // Nothing in the byte says whether the user pressed Escape or
+    // started a sequence.  A device reading a UART is the party whose
+    // read timed out, so a device is the party that resolves it.
+    s = keydecode.feed_byte(keydecode.decoder_new(), 0x1B)
+    good = s.event.kind == keydecode.KEY_EVENT_NONE
+    good = good and keydecode.is_pending(s.decoder)
+    good = good and keydecode.pending_bytes(s.decoder) == 1
+    s = keydecode.flush_step(s.decoder)
+    good = good and s.event.kind == keydecode.KEY_EVENT_PRESSED
+    good = good and s.event.stroke.press.kind == keymodel.KEY_PRESS_NAMED
+    good = good and s.event.stroke.press.name == keymodel.KEY_ESCAPE
+    good = good and keydecode.is_pending(s.decoder) == false
+    say("escape", good)
+
+    hal.uart.write("keymap-nv: bytes in, keys out, with no heap\n")
