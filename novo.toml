@@ -1,7 +1,7 @@
 [package]
 name        = "keymap-nv"
-version     = "0.1.0"
-description = "Keys and mouse reports decoded from the bytes a terminal sends, with no terminal attached: the legacy escape forms, xterm's modifyOtherKeys, the kitty keyboard protocol, three mouse encodings, bracketed paste and UTF-8 — and the lone-ESC ambiguity resolved by a flush the CALLER drives, because only the caller knows its read timed out."
+version     = "0.2.0"
+description = "Keys and mouse reports decoded from the bytes a terminal sends, with no terminal attached: the legacy escape forms, xterm's modifyOtherKeys, the kitty keyboard protocol, three mouse encodings, bracketed paste and UTF-8 — and the lone-ESC ambiguity resolved by a flush the CALLER drives, because only the caller knows its read timed out.  Every value is a @value struct and the held bytes are a fixed-capacity buffer, so the decoder builds and runs on a microcontroller with no heap allocator."
 license     = "Apache-2.0"
 
 # `experimental` because no program outside this repository has used the
@@ -9,23 +9,32 @@ license     = "Apache-2.0"
 # than by a consumer.
 stability   = "experimental"
 
-# `core`, and the one interesting consequence is `flush`.  Resolving a
+# `core`, and the one interesting consequence is the flush.  Resolving a
 # lone ESC needs a clock — is another byte coming, or was that the
 # Escape key? — and a `core` package has no clock.  So the decoder does
 # not time anything: it holds the ambiguous bytes, says it is holding
 # them, and resolves when the host, whose read timed out, says to.  The
 # timeout is where it belongs and the decoding is where it belongs.
+#
+# It carries `tests/embedded_probe.nv`, which builds `keymodel`,
+# `mousedecode` and `keydecode` for a Cortex-M4 and checks four answers
+# on them under QEMU: a control sequence with a modifier, a mouse
+# report, a character outside ASCII, and the lone ESC a flush resolves.
+#
+# `tests/alloc_scan.sh` reads the emitted LLVM for the other half of
+# that: all 109 functions of those three modules appear in the IR at
+# `--opt=0` and none of them calls the allocator.
 layer       = "core"
 
 category    = "terminal"
 
-tags        = ["keyboard", "mouse", "input", "terminal", "crossterm", "kitty-keyboard", "modifyotherkeys", "bracketed-paste", "sans-io"]
+tags        = ["keyboard", "mouse", "input", "terminal", "crossterm", "kitty-keyboard", "modifyotherkeys", "bracketed-paste", "sans-io", "embedded", "no-alloc"]
 repository  = "https://github.com/novolang/keymap-nv"
 maintainers = ["novo-lang"]
-# Built, tested and measured on 0.9.1.  The floor is the toolchain the
+# Built, tested and measured on 0.9.2.  The floor is the toolchain the
 # release was checked against rather than the oldest one that might
 # work.
-novo        = ">= 0.9.1"
+novo        = ">= 0.9.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -43,3 +52,9 @@ novo        = ">= 0.9.1"
 # borrowed a CSI scanner would have to special-case its way around
 # both, and every consumer would pay for an SGR model and a writer it
 # never calls.
+#
+# heapless-nv is the other package a reader will look for here, because
+# the held bytes are a fixed-capacity buffer.  They are four `u64` words
+# inside the decoder's own `@value` struct, which costs no dependency
+# and no allocation; a buffer from another package would be a field a
+# `@value` struct may not hold (SPEC § 14.2).

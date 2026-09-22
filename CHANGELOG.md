@@ -5,6 +5,146 @@ All notable changes to keymap-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.2.0 — 2026-09-22
+
+A breaking release. The decoder builds and runs on a microcontroller
+with no heap allocator, and the shape of every published value changed
+to make that so. `novo build --target=nrf52-qemu
+tests/embedded_probe.nv` produces a Cortex-M4 executable. Under QEMU it
+decodes a control sequence with a modifier, an SGR mouse report and a
+character outside ASCII, and resolves a lone ESC with a flush.
+
+The decoding is unchanged: the same three protocols, the same three
+mouse encodings, the same bracketed paste, and the same lone-ESC
+contract, in which only the caller resolves the ambiguity.
+
+- Every type is a `@value` struct, which is laid out inline and copied
+  at each binding, argument and return rather than held in a heap cell
+  (Novo specification, section 14). A decoder is 72 bytes on a 64-bit
+  machine: two words of settings, five of held bytes, one cursor and one
+  flag. Passing one copies those bytes.
+- A `@value` struct's field may be a scalar, another `@value` struct or
+  a fixed-size array of those, and nothing else. An enum therefore
+  became a number with a table of `pub const` names. A variant that
+  carried a payload became that number beside the payload's own fields.
+  An optional became a named number, and the held bytes became a
+  fixed-capacity buffer.
+- The held bytes are four `u64` words inside the decoder, eight bytes to
+  a word, so `SEQUENCE_BYTES_CAP` is 32 and `decoder_with` clamps
+  `sequence_bytes_max` to it. The default was 64. The widest form any of
+  the three protocols spells is 21 bytes, which is `CSI < 65535 ; 65535
+  ; 65535 M`.
+- `keychunk` is a new module and holds the three entry points that
+  answer a list. A device build reaches every function of every module
+  it compiles, a list is a heap cell, and the three modules a device
+  needs are therefore the three it can have.
+- `tests/embedded_probe.nv` is back, and `tests/alloc_scan.sh` is new:
+  it reads the emitted LLVM and checks that none of the 109 functions of
+  `keymodel`, `mousedecode` and `keydecode` calls the allocator, with a
+  spliced allocation as the control that the scan and the compiler both
+  still catch it.
+- Five suites, 94 tests, and every line under `src/` executed by them.
+  `bash tests/coverage.sh` merges the per-suite LCOV and prints the
+  number, which is 100%.
+
+### Migration
+
+Each old spelling and what it becomes. The names are kept wherever the
+shape allowed one, so the work is mechanical.
+
+**Where a function lives**
+
+| 0.1.0 | 0.2.0 |
+| --- | --- |
+| `keydecode.feed(d, chunk)` | `keychunk.feed(d, chunk)` |
+| `keydecode.flush(d)` | `keychunk.flush(d)`, or `keydecode.flush_step(d)` for one event at a time |
+| `keydecode.decode_one(seq, limits)` | `keychunk.decode_one(seq, limits)` |
+| `keydecode.KeyDrained` | `keychunk.KeyDrained` |
+
+**A keystroke**
+
+| 0.1.0 | 0.2.0 |
+| --- | --- |
+| `KeyChar(c)` as a pattern | `press.kind == keymodel.KEY_PRESS_CHAR`, then `press.codepoint` |
+| `KeyChar(c)` as a constructor | `keymodel.key_char(c)` |
+| `KeyNamed(n)` as a pattern | `press.kind == keymodel.KEY_PRESS_NAMED`, then `press.name` |
+| `KeyNamed(n)` as a constructor | `keymodel.key_named(n)` |
+| `KeyPad(p)` as a pattern | `press.kind == keymodel.KEY_PRESS_PAD`, then `press.pad` |
+| `KeyPad(p)` as a constructor | `keymodel.key_pad(p)` |
+| `KeyFunction(n)` | `press.name == keymodel.KEY_FUNCTION` with `press.number`; built with `keymodel.key_function(n)` |
+| `KeyPadDigit(n)` | `press.pad == keymodel.KEYPAD_DIGIT` with `press.number`; built with `keymodel.key_pad_digit(n)` |
+| `KeyUp`, `KeyEnter`, `KeyEscape`, … | `keymodel.KEY_UP`, `keymodel.KEY_ENTER`, `keymodel.KEY_ESCAPE`, … |
+| `KeyMediaPauseKey` | `keymodel.KEY_MEDIA_PAUSE` — the suffix is gone, because a number and a key name no longer share a namespace |
+| `KeyPadStar`, `KeyPadBegin`, … | `keymodel.KEYPAD_STAR`, `keymodel.KEYPAD_BEGIN`, … |
+| `KeyDownEvent`, `KeyRepeatEvent`, `KeyUpEvent` | `keymodel.KEY_DOWN_EVENT`, `keymodel.KEY_REPEAT_EVENT`, `keymodel.KEY_UP_EVENT`; `KeyStroke.motion` is an `Int` |
+| `a == b` on a `KeyMods` or a `KeyStroke` | `keymodel.mods_eq(a, b)`, `keymodel.stroke_eq(a, b)`, `keymodel.press_eq(a, b)` |
+| `keymodel.control_char(c) -> ?Int` | `-> Int`, answering `keymodel.NO_CODEPOINT` where there is none |
+| `keymodel.char_of_control(b) -> ?Int` | `-> Int`, answering `keymodel.NO_CODEPOINT` where there is none |
+
+**A mouse report**
+
+| 0.1.0 | 0.2.0 |
+| --- | --- |
+| `MouseLeft`, `MouseWheelUp`, … | `mousedecode.MOUSE_LEFT`, `mousedecode.MOUSE_WHEEL_UP`, … |
+| `MouseExtraButton(n)` | `report.button == mousedecode.MOUSE_EXTRA_BUTTON` with `report.button_number` |
+| `MousePressed`, `MouseReleased`, `MouseMoved` | `mousedecode.MOUSE_PRESSED`, `mousedecode.MOUSE_RELEASED`, `mousedecode.MOUSE_MOVED` |
+| `MouseX10Encoding`, `MouseSgrEncoding`, `MouseUrxvtEncoding` | `mousedecode.MOUSE_X10_ENCODING`, `mousedecode.MOUSE_SGR_ENCODING`, `mousedecode.MOUSE_URXVT_ENCODING` |
+| `report_x10`, `report_sgr`, `report_urxvt` answering `?MouseReport` | answering `MouseReport`; `mousedecode.is_report(r)` is the question, and `mousedecode.no_report()` is the answer for bytes that are not one |
+| `mousedecode.decode_button(code) -> MouseButtonKind` | `-> Int`, with `mousedecode.decode_button_number(code)` for buttons 8 to 11 |
+| `mousedecode.button_code(button, mods, motion)` | `button_code(button, number, mods, motion)` — `number` is which of buttons 8 to 11 and is ignored for every other button |
+
+**An event**
+
+| 0.1.0 | 0.2.0 |
+| --- | --- |
+| `KeyPressed(k)` | `e.kind == keydecode.KEY_EVENT_PRESSED`, then `e.stroke`; built with `keydecode.pressed_event(k)` |
+| `KeyMouse(r)` | `e.kind == keydecode.KEY_EVENT_MOUSE`, then `e.mouse`; built with `keydecode.mouse_event(r)` |
+| `KeyPasteByte(b)` | `e.kind == keydecode.KEY_EVENT_PASTE_BYTE`, then `e.byte`; built with `keydecode.byte_event(kind, b)` |
+| `KeyUnknownSequence(f)` | `e.kind == keydecode.KEY_EVENT_UNKNOWN_SEQUENCE`, then `e.byte` |
+| `KeyPasteStart`, `KeyPasteEnd`, `KeyFocusGained`, `KeyFocusLost` | `keydecode.KEY_EVENT_PASTE_START` and the other three; built with `keydecode.marker_event(kind)` |
+| `KeyStep.event` as `?KeyEvent` | a `KeyEvent` whose kind is `keydecode.KEY_EVENT_NONE` where the step completed none |
+| `decode_one` answering `?KeyEvent` | answering a `KeyEvent` whose kind is `keydecode.KEY_EVENT_NONE` |
+
+**The decoder and the protocols**
+
+| 0.1.0 | 0.2.0 |
+| --- | --- |
+| `KeyDecoder.held` as `[u8]` | `KeyHeld`, a fixed-capacity buffer; `keydecode.held_at(d.held, i)` reads byte `i` and `d.held.len` is how many |
+| `KeyLegacyForms`, `KeyWin32Input`, … | `keydecode.KEY_LEGACY_FORMS`, `keydecode.KEY_WIN32_INPUT`, … |
+| `keydecode.protocol_refusal(p) -> ?Str` | `-> Str`, answering the empty string for a protocol that is read |
+| `sequence_bytes_max` of 64 by default | 32, which is `keydecode.SEQUENCE_BYTES_CAP`, and `decoder_with` clamps a larger number down to it |
+
+### Fixed elsewhere
+
+One toolchain defect was found writing this release and is filed
+against the compiler rather than designed around:
+`types-values/module-qualified-value-type-refused-as-a-value-field`. A
+`@value` struct's field and a flat buffer's element type are refused
+when the type is written with its module prefix, and accepted when the
+same type is written bare. Three sites name the filing and write the
+bare name.
+
+The `list.fold` in `paste_bytes` that named
+`memory-perceus/list-map-leaks-a-box-per-element-when-the-lambda-builds-an-enum-variant`
+is gone with the function it was in. Pasted bytes are reported one at a
+time by `flush_step`, there is no enum variant left for the lambda to
+build, and no list operation in the three modules a device reaches.
+
+### Known
+
+- **win32-input-mode is not covered**, and `protocol_refusal` says so
+  with a reason rather than by silence.
+- **The kitty protocol's remaining names have no number here.** The
+  modifier keys themselves, ten keypad keys that duplicate a named key,
+  and three media keys arrive as `KEY_EVENT_UNKNOWN_SEQUENCE`, which
+  carries the final byte and not the number.
+- **A mouse report's bit 3 is reported as `meta`**, which is the name
+  xterm's `ctlseqs` gives it. A program that treats the same bit as alt
+  reads `mods.meta`.
+- **An event is 128 bytes and a step is 200.** A `KeyEvent` carries a
+  keystroke and a mouse report side by side, and a copy of it crosses
+  every call. They are stack bytes on a host and on a device alike.
+
 ## 0.1.0 — 2026-09-18
 
 The bodies.  Bytes in, key and mouse events out, over the legacy escape
