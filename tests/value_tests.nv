@@ -1,0 +1,235 @@
+// value_tests.nv — the shapes a device build needs, checked on a host.
+//
+// `tests/embedded_probe.nv` proves the package runs on a Cortex-M, and
+// `tests/alloc_scan.sh` proves it puts nothing on the heap getting
+// there.  Neither of them can assert much: a probe under QEMU writes
+// `ok` over a UART, and a scan reads compiled output.  The properties
+// those two rest on are asserted here, where a failure names itself.
+//
+// Four of them.  The held bytes live in four packed words, so a
+// sequence long enough to reach the fourth is a case.  The buffer
+// cannot grow, so the caller's ceiling is clamped to its width.  Every
+// value is copied rather than shared, so a decoder a caller kept is
+// never written through.  And a flush is a loop of steps rather than
+// one answer, so a step that resolves nothing is a case too.
+//
+// The effect row on every `@test` is `[io]`, for `test.case` and nothing else.
+
+use std.test
+use std.list
+use keymodel
+use keydecode
+use keychunk
+
+// `ESC` eight times, then an SGR mouse report whose three parameters
+// each take five digits: `CSI < 65432 ; 65432 ; 65432 M`.
+// Twenty-eight bytes, which reaches the fourth word of the held
+// buffer.
+fn long_sequence() -> [Int]
+    let param = list.map(list.range(0, 5), d => '6' - d)
+    var seq = [0x1B, 0x1B, 0x1B, 0x1B, 0x1B, 0x1B, 0x1B, 0x1B, '[', '<']
+    for group in 0..3
+        seq = list.concat(seq, param)
+        if group < 2
+            seq = list.push(seq, ';')
+    list.push(seq, 'M')
+
+// The bytes of a chunk, fed one at a time, with the decoder left over.
+fn feed_all(start: keydecode.KeyDecoder, bytes: [Int]) -> keydecode.KeyDecoder
+    var d = start
+    for b in bytes
+        d = keydecode.feed_byte(d, b).decoder
+    d
+
+@test
+fn test_the_held_buffer_reaches_its_fourth_word() [io]
+    // Byte `i` of the buffer lives in word `i / 8`, so a sequence has
+    // to be past twenty-four bytes long before the fourth word is
+    // written at all.  A decoder that packed or read one word wrongly
+    // would decode every short sequence correctly and this one not.
+    let seq = long_sequence()
+
+    test.case("the sequence is long enough to reach the fourth word")
+    test.assert(list.len(seq) == 28)
+
+    let held = feed_all(keydecode.decoder_new(),
+                        list.slice(seq, 0, list.len(seq) - 1))
+
+    test.case("all but the final byte are held")
+    test.assert(keydecode.pending_bytes(held) == 27)
+
+    test.case("and every one of them reads back, in every word")
+    test.assert(keydecode.held_at(held.held, 0) == 0x1B)
+    test.assert(keydecode.held_at(held.held, 9) == '<')
+    test.assert(keydecode.held_at(held.held, 15) == ';')
+    test.assert(keydecode.held_at(held.held, 16) == '6')
+    test.assert(keydecode.held_at(held.held, 26) == '2')
+
+    test.case("the final byte completes one mouse report")
+    let done = keydecode.feed_byte(held, 'M')
+    test.assert(done.event.kind == keydecode.KEY_EVENT_MOUSE)
+    test.assert(done.event.mouse.col == 65432)
+    test.assert(keydecode.is_pending(done.decoder) == false)
+
+@test
+fn test_a_parameter_stops_growing_rather_than_wrapping() [io]
+    // `CSI` and thirty digits: the number reaches a value no form here
+    // claims and stops there, and the decoder gives up on the sequence
+    // at its ceiling rather than holding more bytes than it has room
+    // for.
+    let seq = list.concat([0x1B, '['], list.map(list.range(0, 30), _ => '1'))
+    let out = keychunk.feed(keydecode.decoder_new(),
+                            list.map(list.push(seq, 'A'), b => b as u8))
+
+    test.case("the sequence is reported rather than grown")
+    test.assert(list.get(out.events, 0).kind
+                == keydecode.KEY_EVENT_UNKNOWN_SEQUENCE)
+
+    test.case("and the decoder is settled afterwards")
+    test.assert(keydecode.is_pending(out.decoder) == false)
+
+@test
+fn test_the_caller_s_ceiling_is_clamped_to_the_buffer() [io]
+    test.case("a ceiling above the buffer is brought down to it")
+    let wide = keydecode.decoder_with(
+        KeyLimits { sequence_bytes_max: 4096, kitty_enabled: true })
+    test.assert(wide.limits.sequence_bytes_max == keydecode.SEQUENCE_BYTES_CAP)
+
+    test.case("a ceiling below one byte is brought up to one")
+    let narrow = keydecode.decoder_with(
+        KeyLimits { sequence_bytes_max: 0, kitty_enabled: true })
+    test.assert(narrow.limits.sequence_bytes_max == 1)
+
+    test.case("a ceiling inside the buffer is kept")
+    let small = keydecode.decoder_with(
+        KeyLimits { sequence_bytes_max: 4, kitty_enabled: true })
+    test.assert(small.limits.sequence_bytes_max == 4)
+
+    test.case("and the kitty setting rides through the clamp unchanged")
+    test.assert(wide.limits.kitty_enabled)
+    test.assert(keydecode.decoder_with(keydecode.legacy_limits()).limits.kitty_enabled == false)
+
+@test
+fn test_a_ceiling_of_four_bytes_gives_up_where_it_says_it_will() [io]
+    // `CSI 1 ; 5 A` is six bytes, and a decoder with room for four
+    // reports the fifth as a sequence it could not read.
+    let d = keydecode.decoder_with(
+        KeyLimits { sequence_bytes_max: 4, kitty_enabled: true })
+    let out = keychunk.feed(d, [0x1B as u8, '[' as u8, '1' as u8, ';' as u8,
+                                '5' as u8, 'A' as u8])
+
+    test.case("the byte past the ceiling is what the refusal names")
+    test.assert(list.get(out.events, 0).kind
+                == keydecode.KEY_EVENT_UNKNOWN_SEQUENCE)
+    test.assert(list.get(out.events, 0).byte == '5')
+
+    test.case("and the byte behind it is read as fresh input")
+    test.assert(list.get(out.events, 1).stroke.press.codepoint == 'A')
+
+@test
+fn test_a_decoder_is_a_value_and_not_a_handle() [io]
+    // Every type in the package is copied at each binding, argument and
+    // return.  A caller that kept the decoder an event came out of has
+    // a decoder, not a view of one, and feeding the copy cannot reach
+    // it.
+    let held = keydecode.feed_byte(keydecode.decoder_new(), 0x1B).decoder
+
+    test.case("the kept decoder is holding one byte")
+    test.assert(keydecode.pending_bytes(held) == 1)
+
+    test.case("feeding it again answers a new decoder")
+    let after = keydecode.feed_byte(held, '[').decoder
+    test.assert(keydecode.pending_bytes(after) == 2)
+
+    test.case("and the one that was kept is unchanged")
+    test.assert(keydecode.pending_bytes(held) == 1)
+
+    test.case("a reset answers a new decoder too")
+    test.assert(keydecode.pending_bytes(keydecode.reset(held)) == 0)
+    test.assert(keydecode.pending_bytes(held) == 1)
+
+@test
+fn test_a_flush_step_can_make_progress_without_an_event() [io]
+    // `ESC ESC [` — the head comes off on the first step, and the two
+    // bytes behind it are read again from the ground state.  The ESC
+    // that opens that reading completes nothing, which is a step with
+    // no event and a decoder still pending.
+    let d = feed_all(keydecode.decoder_new(), [0x1B, 0x1B, '['])
+
+    test.case("three bytes are held")
+    test.assert(keydecode.pending_bytes(d) == 3)
+
+    let first = keydecode.flush_step(d)
+
+    test.case("the first step is the Escape key")
+    test.assert(first.event.kind == keydecode.KEY_EVENT_PRESSED)
+    test.assert(first.event.stroke.press.name == keymodel.KEY_ESCAPE)
+
+    let second = keydecode.flush_step(first.decoder)
+
+    test.case("the second resolves nothing and is still not settled")
+    test.assert(second.event.kind == keydecode.KEY_EVENT_NONE)
+    test.assert(keydecode.is_pending(second.decoder))
+
+    test.case("and stepping to the end gives the other two bytes")
+    let rest = keychunk.flush(second.decoder)
+    test.assert(list.len(rest.events) == 2)
+    test.assert(list.get(rest.events, 0).stroke.press.name == keymodel.KEY_ESCAPE)
+    test.assert(list.get(rest.events, 1).stroke.press.codepoint == '[')
+
+@test
+fn test_a_flush_replays_a_sequence_hiding_behind_an_escape() [io]
+    // `ESC ESC [ A` decodes to Alt and the up arrow, so a flush of
+    // `ESC` and the first three of those has to hand back the Escape
+    // key and then read `ESC [` again from the ground state.
+    let d = feed_all(keydecode.decoder_new(), [0x1B, 0x1B, 0x1B, '[', 'A'])
+
+    test.case("the whole run is held, because ESC ESC ESC [ A is one reading")
+    test.assert(keydecode.pending_bytes(d) == 0)
+
+    test.case("and it decoded to Alt and the arrow")
+    let out = keychunk.feed(keydecode.decoder_new(),
+                            [0x1B as u8, 0x1B as u8, '[' as u8, 'A' as u8])
+    test.assert(list.get(out.events, 0).stroke.press.name == keymodel.KEY_UP)
+    test.assert(list.get(out.events, 0).stroke.mods.alt)
+
+@test
+fn test_a_flush_replays_bytes_that_complete_a_sequence_of_their_own() [io]
+    // A lead byte that promises three continuation bytes holds
+    // whatever follows it without looking at them, so `0xF0 ESC x` is
+    // three bytes of one codepoint as far as the decoder knows.  A
+    // flush says the codepoint never arrived, hands back the lead byte
+    // as a character, and reads the two bytes behind it again — and
+    // those two are Alt and `x`, which is a keystroke.  It is the one
+    // case where replaying a flush's leftovers completes a sequence.
+    let d = feed_all(keydecode.decoder_new(), [0xF0, 0x1B, 'x'])
+
+    test.case("all three bytes are held")
+    test.assert(keydecode.pending_bytes(d) == 3)
+
+    let out = keychunk.flush(d)
+
+    test.case("the lead byte comes back as the character it is")
+    test.assert(list.len(out.events) == 2)
+    test.assert(list.get(out.events, 0).stroke.press.codepoint == 0xF0)
+
+    test.case("and the two behind it decode to Alt and x")
+    test.assert(list.get(out.events, 1).stroke.press.codepoint == 'x')
+    test.assert(list.get(out.events, 1).stroke.mods.alt)
+
+    test.case("with the decoder settled afterwards")
+    test.assert(keydecode.is_pending(out.decoder) == false)
+
+@test
+fn test_the_buffer_and_its_reads_are_published() [io]
+    // A host that logs what a decoder is holding needs the bytes, and
+    // the buffer is a published type for that reason.
+    test.case("a fresh buffer is empty")
+    test.assert(keydecode.held_new().len == 0)
+
+    test.case("and a held sequence reads back byte by byte")
+    let d = feed_all(keydecode.decoder_new(), [0x1B, '[', '1'])
+    test.assert(d.held.len == 3)
+    test.assert(keydecode.held_at(d.held, 0) == 0x1B)
+    test.assert(keydecode.held_at(d.held, 1) == '[')
+    test.assert(keydecode.held_at(d.held, 2) == '1')

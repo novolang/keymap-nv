@@ -12,95 +12,173 @@
 // The model is crossterm's, with one addition.  A key is a named key, a
 // character, or a keypad key, plus a set of modifiers, which is
 // crossterm's `KeyEvent` and what every terminal program written
-// against it reads.  The addition is `KeyMotion`, because the kitty
+// against it reads.  The addition is a motion, because the kitty
 // protocol reports releases and repeats and a program that wanted them
-// had nowhere to put them.  A legacy decode carries `KeyDownEvent`,
+// had nowhere to put them.  A legacy decode carries `KEY_DOWN_EVENT`,
 // which is what a legacy terminal knows.
 //
-// A binding, a chord, a leader key and a mode are not here.  A keymap in
-// the editor sense is a program's configuration.  What this package owes
-// a program is an unambiguous value to look up.
-
-// KeyName is a key that has a name rather than a character.
+// ── Why the choices are numbers ─────────────────────────────────────
 //
-// The set is closed, with `KeyFunction` taking a number rather than
-// there being thirty-five variants.  A terminal that sends something
-// outside it sends a sequence the decoder reports as unrecognised,
-// which is a better answer than an invented variant a program would
-// have to guess the meaning of.
-pub enum KeyName
-    KeyEnter
-    KeyTab
-    // Shift and Tab, which is a sequence of its own rather than Tab
-    // with a modifier in most protocols.  It is a key here, and a
-    // decoder that folded it into `KeyTab` with shift would be
-    // inventing an equivalence the terminal did not send.
-    KeyBackTab
-    KeyBackspace
-    // The Escape key itself, once the ambiguity in `keydecode` has been
-    // resolved.  It is never reported from a lone ESC byte until the
-    // caller's `flush` says the read timed out.
-    KeyEscape
-    KeyInsert
-    KeyDelete
-    KeyHome
-    KeyEnd
-    KeyPageUp
-    KeyPageDown
-    KeyUp
-    KeyDown
-    KeyLeft
-    KeyRight
-    // F1 to F35, by number.
-    KeyFunction(n: Int)
-    KeyMenu
-    KeyPrintScreen
-    KeyPause
-    KeyScrollLock
-    // The three lock keys, which only the kitty protocol reports as
-    // keys at all.
-    KeyCapsLock
-    KeyNumLock
-    // The media keys the kitty protocol defines.  A legacy terminal
-    // never sends one.
-    KeyMediaPlay
-    KeyMediaPauseKey
-    KeyMediaStop
-    KeyMediaNext
-    KeyMediaPrev
-    KeyVolumeUp
-    KeyVolumeDown
-    KeyVolumeMute
-
-// KeyPadKey is a key on the numeric keypad, reported separately from
-// the character it produces.
+// Every type here is a `@value` struct, which is laid out inline with
+// true field widths and is copied at each binding, argument and return
+// (SPEC § 14.4).  That is what lets a decoder run on a device with no
+// heap allocator, and it constrains what a field may be: SPEC § 14.2
+// admits the scalars, another `@value` struct and a fixed-size array of
+// those, and refuses everything else with `E2011` — including an enum,
+// whose values are boxed however few of them carry a payload.
 //
-// It is its own type because the distinction is real and only the kitty
-// protocol makes it.  Keypad 5 and the 5 above the letters send the
-// same byte in the legacy world, and a program that binds one binds
-// both.  `KeyPadBegin` is keypad 5 with NumLock off, which sends
-// nothing at all on most terminals and is why the variant is here
-// rather than folded into `KeyPadDigit(5)`.
-pub enum KeyPadKey
-    KeyPadDigit(n: Int)
-    KeyPadEnter
-    KeyPadPlus
-    KeyPadMinus
-    KeyPadStar
-    KeyPadSlash
-    KeyPadDot
-    KeyPadEqual
-    KeyPadBegin
+// A choice is therefore an `Int` field and a table of `pub const`
+// names, and a variant that carried a payload is that field beside the
+// payload's own fields.  `KeyPress` holds a kind, a codepoint, a name,
+// a keypad key and a number, and the kind says which of the other four
+// to read.
+//
+// A binding, a chord, a leader key and a mode are not here.  A keymap
+// in the editor sense is a program's configuration.  What this package
+// owes a program is an unambiguous value to look up.
 
-// KeyPress is what was pressed: a character, a named key, or a keypad
-// key.
-pub enum KeyPress
-    // A codepoint.  Ctrl and `c` decodes to `KeyChar(0x63)` with `ctrl`
-    // set, which is the letter rather than the control byte, because a
-    // program that matched on 0x03 would be matching on the encoding.
-    KeyChar(codepoint: Int)
-    KeyNamed(name: KeyName)
-    KeyPad(pad: KeyPadKey)
+// ── What was pressed ────────────────────────────────────────────────
+
+// The kind of a `KeyPress`, which says which of its other fields
+// carries the answer.
+//
+// `KEY_PRESS_NONE` is the press of a `KeyPress` that names nothing.  A
+// lookup that has no answer returns one rather than an optional,
+// because an optional stores its payload in a heap cell
+// (SPEC § 14.5) and a device build has no room for one per keystroke.
+pub const KEY_PRESS_NONE = 0
+// A codepoint, in `codepoint`.
+pub const KEY_PRESS_CHAR = 1
+// A key with a name, in `name`.
+pub const KEY_PRESS_NAMED = 2
+// A key on the numeric keypad, in `pad`.
+pub const KEY_PRESS_PAD = 3
+
+// ── The named keys ──────────────────────────────────────────────────
+//
+// The set is closed, with `KEY_FUNCTION` taking a number in
+// `KeyPress.number` rather than there being thirty-five names.  A
+// terminal that sends something outside it sends a sequence the decoder
+// reports as unrecognised.  It is not folded onto a name it is not.
+
+// The name of a `KeyPress` that names no key.
+pub const KEY_NAME_NONE = 0
+// The Enter key.
+pub const KEY_ENTER = 1
+// The Tab key.
+pub const KEY_TAB = 2
+// Shift and Tab, which is a sequence of its own rather than Tab with a
+// modifier in most protocols.  It is a key here.  Folding it into
+// `KEY_TAB` with shift would invent an equivalence the terminal did
+// not send.
+pub const KEY_BACK_TAB = 3
+// The Backspace key, which a terminal sends as the byte 0x7F.
+pub const KEY_BACKSPACE = 4
+// The Escape key itself, once the ambiguity in `keydecode` has been
+// resolved.  It is never reported from a lone ESC byte until the
+// caller's flush says the read timed out.
+pub const KEY_ESCAPE = 5
+// The Insert key.
+pub const KEY_INSERT = 6
+// The Delete key, which is the one above the arrows rather than Backspace.
+pub const KEY_DELETE = 7
+// The Home key.
+pub const KEY_HOME = 8
+// The End key.
+pub const KEY_END = 9
+// The Page Up key.
+pub const KEY_PAGE_UP = 10
+// The Page Down key.
+pub const KEY_PAGE_DOWN = 11
+// The up arrow.
+pub const KEY_UP = 12
+// The down arrow.
+pub const KEY_DOWN = 13
+// The left arrow.
+pub const KEY_LEFT = 14
+// The right arrow.
+pub const KEY_RIGHT = 15
+// F1 to F35.  The number is `KeyPress.number`.
+pub const KEY_FUNCTION = 16
+// The menu key, which sits beside the right-hand platform key.
+pub const KEY_MENU = 17
+// The Print Screen key.
+pub const KEY_PRINT_SCREEN = 18
+// The Pause key.
+pub const KEY_PAUSE = 19
+// The Scroll Lock key.
+pub const KEY_SCROLL_LOCK = 20
+// The two lock keys, which only the kitty protocol reports as keys at
+// all.
+pub const KEY_CAPS_LOCK = 21
+// The Num Lock key.
+pub const KEY_NUM_LOCK = 22
+// The media keys the kitty protocol defines.  A legacy terminal never
+// sends one.
+pub const KEY_MEDIA_PLAY = 23
+// The media pause key.
+pub const KEY_MEDIA_PAUSE = 24
+// The media stop key.
+pub const KEY_MEDIA_STOP = 25
+// The next-track key.
+pub const KEY_MEDIA_NEXT = 26
+// The previous-track key.
+pub const KEY_MEDIA_PREV = 27
+// The volume up key.
+pub const KEY_VOLUME_UP = 28
+// The volume down key.
+pub const KEY_VOLUME_DOWN = 29
+// The mute key.
+pub const KEY_VOLUME_MUTE = 30
+
+// ── The keypad ──────────────────────────────────────────────────────
+//
+// A keypad key is reported separately from the character it produces,
+// because the distinction is real and only the kitty protocol makes it.
+// Keypad 5 and the 5 above the letters send the same byte in the legacy
+// world, and a program that binds one binds both.  `KEYPAD_BEGIN` is
+// keypad 5 with NumLock off, which sends nothing at all on most
+// terminals and is why it is a name of its own rather than
+// `KEYPAD_DIGIT` with a number of 5.
+
+// The keypad key of a `KeyPress` that names none.
+pub const KEYPAD_NONE = 0
+// A keypad digit.  The digit is `KeyPress.number`.
+pub const KEYPAD_DIGIT = 1
+// The keypad's own Enter key.
+pub const KEYPAD_ENTER = 2
+// The keypad plus key.
+pub const KEYPAD_PLUS = 3
+// The keypad minus key.
+pub const KEYPAD_MINUS = 4
+// The keypad multiply key.
+pub const KEYPAD_STAR = 5
+// The keypad divide key.
+pub const KEYPAD_SLASH = 6
+// The keypad decimal point.
+pub const KEYPAD_DOT = 7
+// The keypad equals key, which a VT100 has and a PC keyboard does not.
+pub const KEYPAD_EQUAL = 8
+// Keypad 5 with NumLock off, which most terminals send nothing for.
+pub const KEYPAD_BEGIN = 9
+
+// ── Which way the key went ──────────────────────────────────────────
+//
+// Only the kitty protocol reports a repeat or a release, and only when
+// a program asked it to.  Every legacy decode carries
+// `KEY_DOWN_EVENT`, because a legacy terminal does not know.
+
+// The key went down.  Every legacy decode carries this.
+pub const KEY_DOWN_EVENT = 1
+// The key repeated, which only the kitty protocol reports.
+pub const KEY_REPEAT_EVENT = 2
+// The key came up, which only the kitty protocol reports.
+pub const KEY_UP_EVENT = 3
+
+// The answer of `control_char` and `char_of_control` where the byte or
+// the character has no counterpart.  A number outside both domains,
+// because neither function can answer an optional and stay on a device.
+pub const NO_CODEPOINT = 0 - 1
 
 // KeyMods is which modifiers were held.
 //
@@ -110,7 +188,8 @@ pub enum KeyPress
 // keys rather than as modifiers, because that is what they are.  A
 // program that wants the lock state is tracking it, and this package
 // reports events.
-pub struct KeyMods
+pub @value
+struct KeyMods
     shift: Bool
     alt: Bool
     ctrl: Bool
@@ -118,22 +197,35 @@ pub struct KeyMods
     // practice and no program acts differently on.
     meta: Bool
 
-// KeyMotion is whether the key went down, repeated, or came up.
+// KeyPress is what was pressed, as a kind and the fields that kind
+// names.
 //
-// Only the kitty protocol reports the last two, and only when a program
-// asked it to.  Every legacy decode is `KeyDownEvent`, because a legacy
-// terminal does not know.
-pub enum KeyMotion
-    KeyDownEvent
-    KeyRepeatEvent
-    KeyUpEvent
+// `kind` is one of the four `KEY_PRESS_` numbers and decides the rest.
+// A character reads `codepoint`; a named key reads `name`, and
+// `number` as well when the name is `KEY_FUNCTION`; a keypad key reads
+// `pad`, and `number` as well when the keypad key is `KEYPAD_DIGIT`.
+// The fields a kind does not name are zero.
+pub @value
+struct KeyPress
+    kind: Int
+    // A codepoint.  Ctrl and `c` decodes to the codepoint 0x63 with
+    // `ctrl` set, which is the letter rather than the control byte,
+    // because a program that matched on 0x03 would be matching on the
+    // encoding.
+    codepoint: Int
+    name: Int
+    pad: Int
+    // The number of `KEY_FUNCTION` and of `KEYPAD_DIGIT`, and zero
+    // everywhere else.
+    number: Int
 
 // KeyStroke is one key event: what was pressed, what was held, and
 // which direction it went.
-pub struct KeyStroke
+pub @value
+struct KeyStroke
     press: KeyPress
     mods: KeyMods
-    motion: KeyMotion
+    motion: Int
 
 // The first of the six modifier bits xterm's modifier parameter
 // carries, which is shift.  The parameter is one plus the sum of the
@@ -144,6 +236,52 @@ const MOD_CTRL = 4
 // Super, Hyper and Meta are bits 8, 16 and 32 of the kitty protocol's
 // modifier set.  All three arrive in `meta`.
 const MOD_PLATFORM = 56
+
+// ── Building a press ────────────────────────────────────────────────
+
+// no_press is the press that names nothing, which is what a lookup with
+// no answer returns.
+pub fn no_press() -> KeyPress
+    KeyPress { kind: KEY_PRESS_NONE, codepoint: 0, name: KEY_NAME_NONE,
+               pad: KEYPAD_NONE, number: 0 }
+
+// key_char is the press of a character.
+pub fn key_char(codepoint: Int) -> KeyPress
+    KeyPress { kind: KEY_PRESS_CHAR, codepoint: codepoint, name: KEY_NAME_NONE,
+               pad: KEYPAD_NONE, number: 0 }
+
+// key_named is the press of a key with a name, which is one of the
+// `KEY_` numbers other than `KEY_FUNCTION`.
+pub fn key_named(name: Int) -> KeyPress
+    KeyPress { kind: KEY_PRESS_NAMED, codepoint: 0, name: name,
+               pad: KEYPAD_NONE, number: 0 }
+
+// key_function is the press of F1 to F35.
+pub fn key_function(n: Int) -> KeyPress
+    KeyPress { kind: KEY_PRESS_NAMED, codepoint: 0, name: KEY_FUNCTION,
+               pad: KEYPAD_NONE, number: n }
+
+// key_pad is the press of a keypad key that is not a digit.
+pub fn key_pad(pad: Int) -> KeyPress
+    KeyPress { kind: KEY_PRESS_PAD, codepoint: 0, name: KEY_NAME_NONE,
+               pad: pad, number: 0 }
+
+// key_pad_digit is the press of a keypad digit.
+pub fn key_pad_digit(n: Int) -> KeyPress
+    KeyPress { kind: KEY_PRESS_PAD, codepoint: 0, name: KEY_NAME_NONE,
+               pad: KEYPAD_DIGIT, number: n }
+
+// press_eq says whether two presses are the same key.
+//
+// The fields a kind does not name are zero in every press this package
+// builds, so the comparison is over all five and needs no case
+// analysis.  A `@value` struct has no comparison operator of its own
+// (SPEC § 14.5), which is why the question has a function.
+pub fn press_eq(a: KeyPress, b: KeyPress) -> Bool
+    a.kind == b.kind and a.codepoint == b.codepoint and a.name == b.name
+        and a.pad == b.pad and a.number == b.number
+
+// ── Modifiers ───────────────────────────────────────────────────────
 
 // no_mods is the modifier set with nothing held.
 pub fn no_mods() -> KeyMods
@@ -200,7 +338,10 @@ pub fn mods_any(m: KeyMods) -> Bool
 
 // mods_eq says whether two modifier sets are the same.
 pub fn mods_eq(a: KeyMods, b: KeyMods) -> Bool
-    a == b
+    a.shift == b.shift and a.alt == b.alt and a.ctrl == b.ctrl
+        and a.meta == b.meta
+
+// ── Building a keystroke ────────────────────────────────────────────
 
 // stroke_eq says whether two keystrokes are the same event.
 //
@@ -213,11 +354,17 @@ pub fn mods_eq(a: KeyMods, b: KeyMods) -> Bool
 // use keymodel
 //
 // fn main() [io]
-//     let up = keymodel.named_key(KeyUp)
-//     println("${keymodel.stroke_eq(up, keymodel.named_key(KeyUp))}")   // true
+//     let up = keymodel.named_key(keymodel.KEY_UP)
+//     println("${keymodel.stroke_eq(up, keymodel.named_key(keymodel.KEY_UP))}")   // true
 // ```
 pub fn stroke_eq(a: KeyStroke, b: KeyStroke) -> Bool
-    a == b
+    press_eq(a.press, b.press) and mods_eq(a.mods, b.mods)
+        and a.motion == b.motion
+
+// no_stroke is the keystroke that names nothing, which is what a value
+// carrying a keystroke holds when its kind names a different field.
+pub fn no_stroke() -> KeyStroke
+    KeyStroke { press: no_press(), mods: no_mods(), motion: KEY_DOWN_EVENT }
 
 // char_key is the keystroke for an unmodified character.
 //
@@ -230,25 +377,30 @@ pub fn stroke_eq(a: KeyStroke, b: KeyStroke) -> Bool
 //         println("q")
 // ```
 pub fn char_key(codepoint: Int) -> KeyStroke
-    KeyStroke { press: KeyChar(codepoint), mods: no_mods(), motion: KeyDownEvent }
+    KeyStroke { press: key_char(codepoint), mods: no_mods(),
+                motion: KEY_DOWN_EVENT }
 
 // named_key is the keystroke for an unmodified named key.
-pub fn named_key(name: KeyName) -> KeyStroke
-    KeyStroke { press: KeyNamed(name), mods: no_mods(), motion: KeyDownEvent }
+pub fn named_key(name: Int) -> KeyStroke
+    KeyStroke { press: key_named(name), mods: no_mods(),
+                motion: KEY_DOWN_EVENT }
 
 // ctrl_key is the keystroke for a character with Ctrl held, which is
 // the spelling a program's key table wants for Ctrl and `c`.
 pub fn ctrl_key(codepoint: Int) -> KeyStroke
-    KeyStroke { press: KeyChar(codepoint),
-                mods: KeyMods { shift: false, alt: false, ctrl: true, meta: false },
-                motion: KeyDownEvent }
+    KeyStroke { press: key_char(codepoint),
+                mods: KeyMods { shift: false, alt: false, ctrl: true,
+                                meta: false },
+                motion: KEY_DOWN_EVENT }
 
 // with_mods is a keystroke with its modifiers replaced.
 pub fn with_mods(k: KeyStroke, m: KeyMods) -> KeyStroke
     KeyStroke { press: k.press, mods: m, motion: k.motion }
 
+// ── The legacy control bytes ────────────────────────────────────────
+
 // control_char is the C0 byte a character with Ctrl held arrives as in
-// the legacy encoding, or `None` for a character that has none.
+// the legacy encoding, or `NO_CODEPOINT` for a character that has none.
 //
 // The domain is the space, the letters in either case, and the digits
 // `4` to `7`, which is the set crossterm reads back.  A letter answers
@@ -257,45 +409,45 @@ pub fn with_mods(k: KeyStroke, m: KeyMods) -> KeyStroke
 //
 // `char_of_control` is the inverse everywhere except at three bytes.
 // Ctrl and `i` is 0x09, Ctrl and `m` is 0x0D, and Ctrl and `[` is 0x1B;
-// those bytes are Tab, Enter and Escape, and the inverse answers `None`
-// for them because a key is what they are.
+// those bytes are Tab, Enter and Escape, and the inverse answers
+// `NO_CODEPOINT` for them because a key is what they are.
 //
 // It is `pub` because a program that has to write a key to a child
 // process needs the byte a terminal would have sent, and because a
 // reader comparing the two encodings should not have to derive the
 // mapping again.
-pub fn control_char(codepoint: Int) -> ?Int
+pub fn control_char(codepoint: Int) -> Int
     if codepoint == ' '
-        Some(0)
+        0
     else if codepoint >= 'a' and codepoint <= 'z'
-        Some(codepoint - 0x60)
+        codepoint - 0x60
     else if codepoint >= 'A' and codepoint <= 'Z'
-        Some(codepoint - 0x40)
+        codepoint - 0x40
     else if codepoint >= '4' and codepoint <= '7'
-        Some(codepoint - 0x18)
+        codepoint - 0x18
     else
-        None
+        NO_CODEPOINT
 
 // char_of_control is the character a C0 byte stands for, 0x03 to `c`,
-// or `None` for a byte that is a key in its own right.
+// or `NO_CODEPOINT` for a byte that is a key in its own right.
 //
 // 0x09 is Tab, 0x0D is Enter and 0x1B is Escape, and those three answer
-// `None`.  0x00 is the space with Ctrl held, and 0x1C to 0x1F are the
-// digits `4` to `7` with Ctrl held, which is crossterm's reading of
-// them.
+// `NO_CODEPOINT`.  0x00 is the space with Ctrl held, and 0x1C to 0x1F
+// are the digits `4` to `7` with Ctrl held, which is crossterm's
+// reading of them.
 //
 // Those exceptions are the whole reason this is a function rather than
 // an arithmetic step a caller writes inline.  Ctrl and `i` and Tab are
 // the same byte, and a decoder that reported the first would report Tab
 // as Ctrl and `i` forever.
-pub fn char_of_control(byte: Int) -> ?Int
+pub fn char_of_control(byte: Int) -> Int
     if byte == 0x09 or byte == 0x0D or byte == 0x1B
-        None
+        NO_CODEPOINT
     else if byte == 0
-        Some(' ')
+        ' '
     else if byte >= 1 and byte <= 26
-        Some(byte + 0x60)
+        byte + 0x60
     else if byte >= 0x1C and byte <= 0x1F
-        Some(byte + 0x18)
+        byte + 0x18
     else
-        None
+        NO_CODEPOINT

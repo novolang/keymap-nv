@@ -1,0 +1,102 @@
+// keychunk.nv — the same decoder over a whole read at a time, for a
+// host with a heap.
+//
+// `keydecode` answers one event per call and holds its bytes in a
+// fixed-capacity buffer, because every value in it is a `@value` struct
+// and a device with no heap allocator is where that half has to run.  A
+// program on a host reads a buffer from a file descriptor and wants the
+// events of the whole buffer, which is a list, and a list is a heap
+// cell.
+//
+// So the two halves are two modules, exactly as base64-nv splits its
+// arithmetic from its `Str` and `Bytes` surface.  A device build never
+// reaches this file: `novo build --target=nrf52-qemu` stamps
+// `@tier(embedded)` on every function of every module it compiles, and
+// `list.push` is not admitted there.  A host program uses both.
+//
+// Nothing here decodes.  Each function is a loop over `feed_byte` or
+// `flush_step` that collects what they answer, so the contract is the
+// one `keydecode` states and this module adds no rule of its own.
+
+use std.list
+use keydecode
+
+// KeyDrained is a chunk's or a flush's worth of events, and the decoder
+// left over.
+//
+// A plain struct rather than a `@value` one, because its `events` field
+// is a list.  The decoder inside it is a `@value` struct in a boxed
+// struct's field, which is one of the five crossings SPEC § 14.5 names:
+// the store copies the decoder into a cell and the read copies it back
+// out, so what a caller takes out of `decoder` is a value again.
+// `events` names its element type without the module prefix because a
+// module-qualified `@value` type is not recognised as the element of a
+// flat buffer on this toolchain (novo bug
+// types-values/module-qualified-value-type-refused-as-a-value-field);
+// the `use` line above is what makes the bare name resolve.
+pub struct KeyDrained
+    decoder: keydecode.KeyDecoder
+    events: [KeyEvent]
+
+// feed advances the decoder over a whole chunk.
+//
+// A read gives a chunk, the chunk gives events, and whatever is left
+// over stays held for the next read, or for the `flush` after the read
+// that times out.
+//
+// ```novo
+// use std.list
+// use std.str
+// use keychunk
+// use keydecode
+//
+// fn main() [io]
+//     // The three bytes a terminal sends for the up arrow: ESC [ A.
+//     let out = keychunk.feed(keydecode.decoder_new(), [0x1B, 0x5B, 0x41])
+//     println(str.from_int(list.len(out.events)))   // 1
+// ```
+pub fn feed(d: keydecode.KeyDecoder, chunk: [u8]) -> KeyDrained
+    var q = d
+    var events: [KeyEvent] = []
+    for b in chunk
+        let s = keydecode.feed_byte(q, b as Int)
+        q = s.decoder
+        if s.event.kind != keydecode.KEY_EVENT_NONE
+            events = list.push(events, s.event)
+    KeyDrained { decoder: q, events: events }
+
+// flush resolves everything the decoder is holding, on the caller's
+// word that no more bytes are coming.
+//
+// The loop over `keydecode.flush_step`, run until the decoder is
+// settled.  It answers a list rather than one event because resolving a
+// held sequence can produce several: an `ESC [` that never finished is
+// the Escape key, then `[`.
+//
+// Calling it on a settled decoder produces no events and is harmless,
+// so a host may call it after every timed-out read without checking.
+pub fn flush(d: keydecode.KeyDecoder) -> KeyDrained
+    var q = d
+    var events: [KeyEvent] = []
+    while keydecode.is_pending(q)
+        let s = keydecode.flush_step(q)
+        q = s.decoder
+        if s.event.kind != keydecode.KEY_EVENT_NONE
+            events = list.push(events, s.event)
+    KeyDrained { decoder: q, events: events }
+
+// decode_one is the whole decoder over a complete sequence, for a
+// caller that already has one.
+//
+// The answer's kind is `keydecode.KEY_EVENT_NONE` when the bytes are
+// not one complete sequence, which is a prefix, an empty list,
+// something this package does not read, or two sequences at once.  It
+// exists for the two callers that are not read loops: a test with a
+// fixture, and a program with a key binding written as the bytes a
+// terminal sends, which is how a configuration file spells one.
+pub fn decode_one(sequence: [u8], limits: keydecode.KeyLimits) -> keydecode.KeyEvent
+    let out = feed(keydecode.decoder_with(limits), sequence)
+    if list.len(out.events) == 1 and keydecode.is_pending(out.decoder) == false
+        list.get(out.events, 0)
+    else
+        keydecode.no_event()

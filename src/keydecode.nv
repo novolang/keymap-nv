@@ -9,12 +9,12 @@
 // terminal program resolves this with a timeout, and every one of them
 // puts the timeout somewhere different.
 //
-// A `core` package has no clock, which turns out to be the right
-// constraint rather than an obstacle.  This decoder times nothing.  It
-// holds the ambiguous bytes, reports that it is holding them, and
-// resolves them when the host, whose read timed out, calls `flush`.
-// The timeout lives where the reading lives, and the decoding lives
-// here.
+// A `core` package has no clock.  This decoder therefore times
+// nothing.  It holds the ambiguous bytes, reports that it is holding
+// them, and
+// resolves them when the host, whose read timed out, drives
+// `flush_step`.  The timeout lives where the reading lives, and the
+// decoding lives here.
 //
 // Three protocols are read at once, and a fourth is refused:
 //
@@ -35,44 +35,156 @@
 //                     arithmetic.
 //
 // Which protocol is in use is not a setting.  All three are read at
-// once, because their sequences do not collide and a decoder that had
-// to be told would be wrong every time the negotiation was.  What is a
+// once, because their sequences do not collide.  A decoder that had to
+// be told would be wrong every time the negotiation was.  What is a
 // setting is whether the kitty forms are read at all, for a program
 // running against a terminal it has not negotiated with.
 //
-// The state is the bytes themselves.  `held` carries the sequence in
-// progress, and every byte re-reads it from the start, which is what
+// ── The storage, and why it is what it is ───────────────────────────
+//
+// Every type here is a `@value` struct: laid out inline with true field
+// widths, copied at each binding, argument and return, and never on the
+// heap (SPEC § 14.4).  That is what lets the module run on a device
+// with no heap allocator, and it decides three things about the shapes
+// below.
+//
+// A field may be a scalar, another `@value` struct, or a fixed-size
+// array of those, and nothing else (SPEC § 14.2).  So a list is not
+// available for the held bytes, an optional is not available for a
+// step that completed nothing, and an enum is not available for a
+// choice.  Each choice is an `Int` field with a table of `pub const`
+// names, each absence is a named number, and the held bytes are packed
+// eight to a `u64` word in `KeyHeld`.
+//
+// The state is still the bytes themselves.  `held` carries the sequence
+// in progress, and every byte re-reads it from the start, which is what
 // lets one buffer serve a sequence, a partly arrived codepoint and the
 // end marker of a paste.  A sequence is at most `sequence_bytes_max`
-// bytes long, so the work per byte is bounded by that number.
+// bytes long, so the work per byte is bounded by that number, and the
+// buffer that holds it is `SEQUENCE_BYTES_CAP` bytes wide.
+//
+// A `@value` struct is copied at every by-value pass, so the decoder is
+// kept small: four words of held bytes, the count, the cursor a flush
+// walks with, and the two settings.
 
-use std.list
 use keymodel
 use mousedecode
 
-// KeyProtocol names an input protocol, so that a program can ask what
-// this package reads before it asks a terminal to speak it.
-pub enum KeyProtocol
-    KeyLegacyForms
-    KeyModifyOtherKeys
-    KeyKittyKeyboard
-    KeyWin32Input
+// ── The protocols ───────────────────────────────────────────────────
+
+// The classic forms: a C0 byte for Ctrl and a letter, and an escape
+// sequence for a key with a name.
+pub const KEY_LEGACY_FORMS = 0
+// xterm's `CSI 27 ; <mods> ; <codepoint> ~`, which spells a combination
+// no legacy form can.
+pub const KEY_MODIFY_OTHER_KEYS = 1
+// The kitty keyboard protocol's `CSI <codepoint> ; <mods> : <event> u`
+// and its named-key forms.
+pub const KEY_KITTY_KEYBOARD = 2
+// The Windows console's six-parameter key event record.
+// `protocol_refusal` says why it is not read.
+pub const KEY_WIN32_INPUT = 3
 
 // protocol_supported says whether this package decodes a protocol.
-pub fn protocol_supported(p: KeyProtocol) -> Bool
-    match p
-        KeyWin32Input => false
-        _             => true
+pub fn protocol_supported(p: Int) -> Bool
+    p != KEY_WIN32_INPUT
 
-// protocol_refusal is why a protocol is not read, or `None` when it is.
+// protocol_refusal is why a protocol is not read, and the empty string
+// where it is read.
 //
 // A refusal with a reason rather than an absence, because whether this
 // package reads win32-input-mode is a question a reader will ask, and
 // the answer is more useful than the silence.
-pub fn protocol_refusal(p: KeyProtocol) -> ?Str
-    match p
-        KeyWin32Input => Some("win32-input-mode carries a Windows console KEY_EVENT_RECORD, whose virtual key code and scan code need a Windows keyboard-layout table to become a key")
-        _             => None
+pub fn protocol_refusal(p: Int) -> Str
+    if p == KEY_WIN32_INPUT
+        "win32-input-mode carries a Windows console KEY_EVENT_RECORD, whose virtual key code and scan code need a Windows keyboard-layout table to become a key"
+    else
+        ""
+
+// ── What one thing that happened at the terminal is ─────────────────
+
+// The step completed nothing.  Most bytes of a sequence complete
+// nothing, and a decoder that is holding nothing has nothing to flush.
+pub const KEY_EVENT_NONE = 0
+// A key was pressed, repeated or released.  The keystroke is `stroke`.
+pub const KEY_EVENT_PRESSED = 1
+// A mouse report arrived.  The report is `mouse`.
+pub const KEY_EVENT_MOUSE = 2
+// A bracketed paste is starting.  Everything until
+// `KEY_EVENT_PASTE_END` is pasted text and not typing, which is the
+// distinction an editor needs and the reason the mode exists.
+pub const KEY_EVENT_PASTE_START = 3
+// One byte of pasted text, in `byte`.  A byte at a time rather than a
+// string at the end, so that a paste of any size costs the decoder
+// nothing to carry and a program can stream it into a buffer of its
+// own.
+pub const KEY_EVENT_PASTE_BYTE = 4
+// A bracketed paste is over.
+pub const KEY_EVENT_PASTE_END = 5
+// The terminal window gained focus, which is DEC mode 1004 and
+// `CSI I`.
+pub const KEY_EVENT_FOCUS_GAINED = 6
+// The terminal window lost focus, which is `CSI O`.
+pub const KEY_EVENT_FOCUS_LOST = 7
+// A sequence this package read the shape of and not the meaning, which
+// is a CSI with a final byte nothing here claims.  The final byte is
+// `byte`.  Reported rather than dropped, because a program that knows
+// about a sequence this package does not, such as a terminal's own
+// extension or a query reply it asked for, has to be able to see it.
+pub const KEY_EVENT_UNKNOWN_SEQUENCE = 8
+
+// KeyEvent is one thing that happened at the terminal, as a kind and
+// the fields that kind names.
+//
+// The fields a kind does not name are the empty keystroke, the empty
+// report and zero.  A `@value` struct has no variant that carries a
+// payload, so every payload is a field and `kind` says which to read.
+pub @value
+struct KeyEvent
+    kind: Int
+    // `stroke` and `mouse` are spelled without their module prefix
+    // because a module-qualified type name is refused as a `@value`
+    // field on this toolchain (novo bug
+    // types-values/module-qualified-value-type-refused-as-a-value-field);
+    // the `use` lines above are what make the bare names resolve.
+    stroke: KeyStroke
+    mouse: MouseReport
+    // The byte of `KEY_EVENT_PASTE_BYTE`, and the final byte of
+    // `KEY_EVENT_UNKNOWN_SEQUENCE`.
+    byte: Int
+
+// ── The decoder ─────────────────────────────────────────────────────
+
+// How many bytes of one sequence the decoder has room for.
+//
+// The widest form any of the three protocols spells is the SGR mouse
+// report with every parameter at its ceiling, `CSI < 65535 ; 65535 ;
+// 65535 M`, which is 21 bytes; an ESC prefix in front of one adds a
+// byte each.  32 is that with room over, and it is four `u64` words,
+// which is what the held bytes are packed into.
+//
+// `sequence_bytes_max` is the caller's ceiling and may be lower.  It is
+// clamped to this number by `decoder_with`, because the buffer cannot
+// grow.
+pub const SEQUENCE_BYTES_CAP = 32
+
+// How many bytes one `u64` word of the held buffer carries.
+const BYTES_PER_WORD = 8
+
+// KeyHeld is the bytes of a sequence in progress, packed eight to a
+// word.
+//
+// A fixed-capacity buffer rather than a list, because a list is a heap
+// cell and a `@value` struct may not hold one (SPEC § 14.2).  Byte `i`
+// lives in word `i / 8` at bit `(i % 8) * 8`, and the bytes above `len`
+// are zero, which is what lets a push be one shift and one `or`.
+pub @value
+struct KeyHeld
+    w0: u64
+    w1: u64
+    w2: u64
+    w3: u64
+    len: Int
 
 // KeyLimits is the ceiling on what the decoder will hold.
 //
@@ -81,9 +193,11 @@ pub fn protocol_refusal(p: KeyProtocol) -> ?Str
 // the bound on it is the caller's.  A bracketed paste needs no bound,
 // because its bytes are reported as they arrive and none of them is
 // kept.
-pub struct KeyLimits
+pub @value
+struct KeyLimits
     // Bytes of one escape sequence held before the decoder gives up on
-    // it and reports `KeyUnknownSequence`.
+    // it and reports an unrecognised sequence.  Clamped to
+    // `SEQUENCE_BYTES_CAP`.
     sequence_bytes_max: Int
     // Whether the kitty forms are read.  A program that has not
     // negotiated the protocol may still want them off, because a
@@ -91,69 +205,37 @@ pub struct KeyLimits
     // does by anything but the negotiation.
     kitty_enabled: Bool
 
-// KeyDecoder is the input state machine: what it is holding, and how
-// much of it.
+// KeyDecoder is the input state machine: what it is holding, how much
+// of it, and how far a flush has got through it.
 //
 // A value, like ansi-nv's parser and for the same reason.  `feed_byte`
 // takes one and returns one, so a caller may keep the decoder an event
 // came out of.
-pub struct KeyDecoder
+pub @value
+struct KeyDecoder
     limits: KeyLimits
-    // The bytes of a sequence in progress, of a codepoint in progress,
-    // or of a paste's end marker in progress.  Empty when the decoder
-    // is settled.
-    held: [u8]
+    held: KeyHeld
+    // How many of the held bytes are the sequence in progress.  It
+    // equals `held.len` everywhere except part-way through a flush,
+    // where the bytes behind it are waiting to be read again from the
+    // ground state.
+    scan_len: Int
     // Whether a bracketed paste is open.  Kept apart from `held`
     // because a paste's bytes are reported as they arrive rather than
     // accumulated, so during one the decoder holds at most the five
     // bytes of a half-arrived end marker.
     in_paste: Bool
 
-// KeyEvent is one thing that happened at the terminal.
-pub enum KeyEvent
-    KeyPressed(stroke: keymodel.KeyStroke)
-    KeyMouse(report: mousedecode.MouseReport)
-    // A bracketed paste is starting.  Everything until `KeyPasteEnd` is
-    // pasted text and not typing, which is the distinction an editor
-    // needs and the reason the mode exists.
-    KeyPasteStart
-    // One byte of pasted text.  A byte at a time rather than a string
-    // at the end, so that a paste of any size costs the decoder nothing
-    // to carry and a program can stream it into a buffer of its own.
-    KeyPasteByte(byte: Int)
-    KeyPasteEnd
-    // The terminal window gained focus, which is DEC mode 1004 and
-    // `CSI I`.
-    KeyFocusGained
-    // The terminal window lost focus, which is `CSI O`.
-    KeyFocusLost
-    // A sequence this package read the shape of and not the meaning,
-    // which is a CSI with a final byte nothing here claims.  Reported
-    // rather than dropped, because a program that knows about a
-    // sequence this package does not, such as a terminal's own
-    // extension or a query reply it asked for, has to be able to see
-    // it.
-    KeyUnknownSequence(final_byte: Int)
-
-// KeyStep is one byte's worth of progress.
-pub struct KeyStep
+// KeyStep is one byte's worth of progress, or one flush's worth.
+pub @value
+struct KeyStep
     decoder: KeyDecoder
-    // The event the byte completed, if it completed one.  Most bytes of
-    // a sequence complete nothing.
-    event: ?KeyEvent
-
-// KeyDrained is a chunk's or a flush's worth of events, and the decoder
-// left over.
-//
-// `flush` returns a list rather than one event because resolving a held
-// sequence can produce several.  An `ESC [` that never finished is the
-// Escape key, then `[`.
-pub struct KeyDrained
-    decoder: KeyDecoder
-    events: [KeyEvent]
+    // The event the step completed.  Its kind is `KEY_EVENT_NONE` where
+    // the step completed none, which most bytes of a sequence do.
+    event: KeyEvent
 
 // How long a host should wait for the byte after a lone ESC before
-// calling `flush`, in milliseconds.
+// flushing, in milliseconds.
 //
 // A number, not a timer: this package cannot wait and does not try to.
 // 25 is what vim, tmux and crossterm converge on.  It is long enough
@@ -181,6 +263,9 @@ const PARAM_MAX = 65535
 const PASTE_START_PARAM = 200
 const PASTE_END_PARAM = 201
 
+// How many bytes `CSI 201 ~` is.
+const PASTE_MARKER_LEN = 6
+
 // The parameter of xterm's modifyOtherKeys form, `CSI 27 ; <mods> ;
 // <codepoint> ~`.
 const MODIFY_OTHER_PARAM = 27
@@ -194,33 +279,133 @@ const KITTY_RELEASE = 3
 // private use area from 57344 upwards.
 const KITTY_FUNCTIONAL = 57344
 
-// default_limits allows 64 bytes of one sequence and reads the kitty
-// forms.
-pub fn default_limits() -> KeyLimits
-    KeyLimits { sequence_bytes_max: 64, kitty_enabled: true }
+// ── Building the values a caller sees ───────────────────────────────
 
-// legacy_limits allows 64 bytes of one sequence and does not read the
-// kitty forms.
+// no_event is the event of a step that completed nothing.
+pub fn no_event() -> KeyEvent
+    KeyEvent { kind: KEY_EVENT_NONE,
+               stroke: keymodel.no_stroke(), mouse: mousedecode.no_report(),
+               byte: 0 }
+
+// pressed_event is the event of a keystroke.
+pub fn pressed_event(k: keymodel.KeyStroke) -> KeyEvent
+    KeyEvent { kind: KEY_EVENT_PRESSED, stroke: k,
+               mouse: mousedecode.no_report(), byte: 0 }
+
+// mouse_event is the event of a mouse report.
+pub fn mouse_event(r: mousedecode.MouseReport) -> KeyEvent
+    KeyEvent { kind: KEY_EVENT_MOUSE, stroke: keymodel.no_stroke(), mouse: r,
+               byte: 0 }
+
+// marker_event is the event of a kind that carries no payload, which is
+// the two ends of a paste and the two focus events.
+pub fn marker_event(kind: Int) -> KeyEvent
+    KeyEvent { kind: kind, stroke: keymodel.no_stroke(),
+               mouse: mousedecode.no_report(), byte: 0 }
+
+// byte_event is the event of a kind whose payload is one byte, which is
+// a pasted byte and an unrecognised sequence's final byte.
+pub fn byte_event(kind: Int, b: Int) -> KeyEvent
+    KeyEvent { kind: kind, stroke: keymodel.no_stroke(),
+               mouse: mousedecode.no_report(), byte: b }
+
+// default_limits allows a whole buffer's worth of one sequence and
+// reads the kitty forms.
+pub fn default_limits() -> KeyLimits
+    KeyLimits { sequence_bytes_max: SEQUENCE_BYTES_CAP, kitty_enabled: true }
+
+// legacy_limits allows the same and does not read the kitty forms.
 pub fn legacy_limits() -> KeyLimits
-    KeyLimits { sequence_bytes_max: 64, kitty_enabled: false }
+    KeyLimits { sequence_bytes_max: SEQUENCE_BYTES_CAP, kitty_enabled: false }
+
+// The limits with the sequence ceiling brought inside the buffer.  A
+// ceiling above the buffer would be one the decoder could not keep, and
+// a ceiling below one byte would hold nothing at all.
+fn clamped(l: KeyLimits) -> KeyLimits
+    if l.sequence_bytes_max < 1
+        KeyLimits { sequence_bytes_max: 1, kitty_enabled: l.kitty_enabled }
+    else if l.sequence_bytes_max > SEQUENCE_BYTES_CAP
+        KeyLimits { sequence_bytes_max: SEQUENCE_BYTES_CAP,
+                    kitty_enabled: l.kitty_enabled }
+    else
+        l
+
+// held_new is the buffer with nothing in it.
+pub fn held_new() -> KeyHeld
+    KeyHeld { w0: 0 as u64, w1: 0 as u64, w2: 0 as u64, w3: 0 as u64, len: 0 }
+
+// held_at is byte `i` of the buffer.
+//
+// Reading past `len` answers zero, because the bytes above the length
+// are zero and are kept that way.
+pub fn held_at(h: KeyHeld, i: Int) -> Int
+    let w = i / BYTES_PER_WORD
+    let sh = i % BYTES_PER_WORD * 8
+    let word = if w == 0
+        h.w0
+    else
+        if w == 1
+            h.w1
+        else
+            if w == 2
+                h.w2
+            else
+                h.w3
+    (word as Int >> sh) & 0xFF
+
+// The buffer with one more byte on the end.  The caller has already
+// checked that there is room, which every caller here does from
+// `sequence_bytes_max`.
+fn held_push(h: KeyHeld, b: Int) -> KeyHeld
+    let w = h.len / BYTES_PER_WORD
+    let sh = h.len % BYTES_PER_WORD * 8
+    let add = ((b & 0xFF) << sh) as u64
+    KeyHeld { w0: (if w == 0 then h.w0 | add else h.w0),
+              w1: (if w == 1 then h.w1 | add else h.w1),
+              w2: (if w == 2 then h.w2 | add else h.w2),
+              w3: (if w == 3 then h.w3 | add else h.w3),
+              len: h.len + 1 }
+
+// The buffer with its first `k` bytes taken off.
+//
+// It is built from zero rather than shifted, which is what keeps the
+// bytes above the new length zero and a push one `or`.
+fn held_drop_front(h: KeyHeld, k: Int) -> KeyHeld
+    var out = held_new()
+    for i in k..h.len
+        out = held_push(out, held_at(h, i))
+    out
+
+// The first `n` bytes of the buffer, for reading only.
+//
+// The words are unchanged and only the length moves, so the bytes above
+// `n` are still set and a push onto the answer would `or` into them.
+// Nothing here pushes onto one.
+fn held_prefix(h: KeyHeld, n: Int) -> KeyHeld
+    KeyHeld { w0: h.w0, w1: h.w1, w2: h.w2, w3: h.w3, len: n }
 
 // decoder_new is a settled decoder with `default_limits`.
 pub fn decoder_new() -> KeyDecoder
     decoder_with(default_limits())
 
-// decoder_with is a settled decoder with the limits given.
+// decoder_with is a settled decoder with the limits given, brought
+// inside the buffer.
 pub fn decoder_with(limits: KeyLimits) -> KeyDecoder
-    KeyDecoder { limits: limits, held: [], in_paste: false }
+    KeyDecoder { limits: clamped(limits), held: held_new(), scan_len: 0,
+                 in_paste: false }
+
+// ── The surface a read loop drives ──────────────────────────────────
 
 // feed_byte advances the decoder by one byte.
 //
 // The entry point everything else is written over.  Most bytes of a
-// sequence complete nothing and come back with `event: None`, and the
-// byte that finishes one comes back with the event.
+// sequence complete nothing and come back with an event of kind
+// `KEY_EVENT_NONE`, and the byte that finishes one comes back with the
+// event.
 //
 // A lone ESC is never reported as the Escape key here, however long ago
 // it arrived, because this function has no idea how long ago that was.
-// It leaves the decoder pending, and `flush` is what resolves it.
+// It leaves the decoder pending, and `flush_step` is what resolves it.
 //
 // ```novo
 // use keydecode
@@ -228,96 +413,85 @@ pub fn decoder_with(limits: KeyLimits) -> KeyDecoder
 // fn main() [io]
 //     let d = keydecode.decoder_new()
 //     let step = keydecode.feed_byte(d, 0x1B)
-//     match step.event
-//         None    => println("held — could be Escape, could be an arrow")
-//         Some(_) => println("an event, which a lone ESC never is")
+//     if step.event.kind == keydecode.KEY_EVENT_NONE
+//         println("held — could be Escape, could be an arrow")
 // ```
 pub fn feed_byte(d: KeyDecoder, b: Int) -> KeyStep
     if d.in_paste
         paste_byte(d, b)
-    else if list.len(d.held) == 0
+    else if d.held.len == 0
         first_byte(d, b)
     else
         next_byte(d, b)
 
-// feed advances the decoder over a whole chunk.
-//
-// The convenience over `feed_byte`, and the one most hosts will use.  A
-// read gives a chunk, the chunk gives events, and whatever is left over
-// stays held for the next read, or for the `flush` after the read that
-// times out.
-pub fn feed(d: KeyDecoder, chunk: [u8]) -> KeyDrained
-    var q = d
-    var events: [KeyEvent] = []
-    for b in chunk
-        let s = feed_byte(q, b as Int)
-        q = s.decoder
-        events = with_event(events, s.event)
-    KeyDrained { decoder: q, events: events }
-
-// flush resolves whatever the decoder is holding, on the caller's word
-// that no more bytes are coming.
+// flush_step resolves one event out of whatever the decoder is holding,
+// on the caller's word that no more bytes are coming.
 //
 // A host reads with a timeout.  When the read times out and the decoder
-// is pending, it calls this, and the held bytes become events: a lone
-// ESC becomes the Escape key, an `ESC [` that never finished becomes
-// Escape and then `[`, and a half-arrived codepoint becomes one
-// character per byte.
+// is pending, it calls this until `is_pending` is false, and the held
+// bytes become events: a lone ESC becomes the Escape key, an `ESC [`
+// that never finished becomes Escape and then `[`, and a half-arrived
+// codepoint becomes one character per byte.
 //
-// Calling it on a settled decoder produces no events and is harmless,
-// so a host may call it after every timed-out read without checking.
+// A step answers one event at most, and a step that answers
+// `KEY_EVENT_NONE` while the decoder is still pending has made
+// progress through the held bytes without completing anything.  The
+// loop to write is therefore `while is_pending`, not one call.
+//
+// Calling it on a settled decoder produces nothing and is harmless, so
+// a host may call it after every timed-out read without checking.
 //
 // ```novo
-// use std.list
 // use keydecode
 //
 // fn main() [io]
 //     var d = keydecode.decoder_new()
-//     let step = keydecode.feed_byte(d, 0x1B)
-//     d = step.decoder
+//     d = keydecode.feed_byte(d, 0x1B).decoder
 //     // …the host's read times out here, and only the host knows it.
-//     let drained = keydecode.flush(d)
-//     match list.get(drained.events, 0)
-//         KeyPressed(_) => println("Escape, resolved by the caller's clock")
-//         _             => println("something else")
+//     let step = keydecode.flush_step(d)
+//     if step.event.kind == keydecode.KEY_EVENT_PRESSED
+//         println("Escape, resolved by the caller's clock")
 // ```
-pub fn flush(d: KeyDecoder) -> KeyDrained
-    if list.len(d.held) == 0
-        return KeyDrained { decoder: d, events: [] }
+pub fn flush_step(d: KeyDecoder) -> KeyStep
+    if d.held.len == 0
+        return KeyStep { decoder: d, event: no_event() }
     if d.in_paste
-        return KeyDrained { decoder: settled(d), events: paste_bytes(d.held) }
-    // The first held byte is the ESC that was never resolved, or the
-    // lead of a codepoint that never arrived.  Either way it is now a
-    // key of its own, and the bytes behind it are read again from a
-    // settled decoder, which is what makes `ESC [` two events rather
-    // than one.
-    let first = byte_at(d.held, 0)
-    let head = if first == ESC
-        KeyPressed(keymodel.named_key(KeyEscape))
-    else
-        KeyPressed(keymodel.char_key(first))
-    let again = feed(settled(d), list.slice(d.held, 1, list.len(d.held)))
-    let rest = flush(again.decoder)
-    KeyDrained { decoder: rest.decoder,
-                 events: list.concat(list.concat([head], again.events), rest.events) }
+        // A flush inside a paste reports what is held and leaves the
+        // paste open, because the terminal has not said it is over.
+        return KeyStep { decoder: with_held(d, held_drop_front(d.held, 1)),
+                         event: byte_event(KEY_EVENT_PASTE_BYTE,
+                                           held_at(d.held, 0)) }
+    if d.scan_len == d.held.len
+        // The bytes are a sequence that never finished.  Its first byte
+        // is the ESC that was never resolved, or the lead of a
+        // codepoint that never arrived; either way it is now a key of
+        // its own, and the bytes behind it are read again from the
+        // ground state, which is what makes `ESC [` two events.
+        let first = held_at(d.held, 0)
+        let head = if first == ESC
+            pressed_event(keymodel.named_key(keymodel.KEY_ESCAPE))
+        else
+            pressed_event(keymodel.char_key(first))
+        return KeyStep { decoder: replaying(d, held_drop_front(d.held, 1)),
+                         event: head }
+    replay_step(d)
 
 // is_pending says whether the decoder is holding bytes it cannot
-// resolve without either another byte or a `flush`.
+// resolve without either another byte or a flush.
 //
 // What a host's read loop switches on.  Pending means read with the
 // escape timeout, and settled means block.  A host that always used a
-// timeout would spin, and one that always blocked would leave the
-// Escape key stuck until the next keystroke, which is the bug every
-// terminal program has shipped at least once.
+// timeout would spin.  One that always blocked would leave the Escape
+// key stuck until the next keystroke.
 pub fn is_pending(d: KeyDecoder) -> Bool
-    list.len(d.held) > 0
+    d.held.len > 0
 
 // pending_bytes is how many bytes the decoder is holding.
 //
 // For a host that logs, and for a test that wants to assert a chunk
 // boundary left exactly what it should have.
 pub fn pending_bytes(d: KeyDecoder) -> Int
-    list.len(d.held)
+    d.held.len
 
 // in_paste says whether a bracketed paste is open.
 //
@@ -336,61 +510,65 @@ pub fn in_paste(d: KeyDecoder) -> Bool
 pub fn reset(d: KeyDecoder) -> KeyDecoder
     decoder_with(d.limits)
 
-// decode_one is the whole decoder over a complete sequence, for a
-// caller that already has one.
-//
-// `None` when the bytes are not one complete sequence, which is a
-// prefix, an empty list, something this package does not read, or two
-// sequences at once.  It exists for the two callers that are not read
-// loops: a test with a fixture, and a program with a key binding
-// written as the bytes a terminal sends, which is how a configuration
-// file spells one.
-pub fn decode_one(sequence: [u8], limits: KeyLimits) -> ?KeyEvent
-    let out = feed(decoder_with(limits), sequence)
-    if list.len(out.events) == 1 and is_pending(out.decoder) == false
-        Some(list.get(out.events, 0))
-    else
-        None
-
 // ── the machinery behind the surface ────────────────────────────────
 //
 // Nothing below is `pub`.  Each step builds a fresh `KeyDecoder` rather
-// than assigning a field of a copy, so the decoder a caller kept is
-// never written through.
+// than assigning a field of a copy, which is the only way a `@value`
+// struct changes at all (SPEC § 14.3).
 
-// One byte of a list, as the number the rest of the module works in.
-fn byte_at(h: [u8], i: Int) -> Int
-    list.get(h, i) as Int
-
-// The decoder with nothing held, keeping its limits and its paste.
-fn settled(d: KeyDecoder) -> KeyDecoder
-    KeyDecoder { limits: d.limits, held: [], in_paste: d.in_paste }
+// The decoder holding `held`, with its cursor where feeding leaves it,
+// which is at the end of what is held.
+fn with_held(d: KeyDecoder, held: KeyHeld) -> KeyDecoder
+    KeyDecoder { limits: d.limits, held: held, scan_len: held.len,
+                 in_paste: d.in_paste }
 
 // The step that holds `held` and reports nothing.
-fn holding(d: KeyDecoder, held: [u8]) -> KeyStep
-    KeyStep { decoder: KeyDecoder { limits: d.limits, held: held,
-                                    in_paste: d.in_paste },
-              event: None }
+fn holding(d: KeyDecoder, held: KeyHeld) -> KeyStep
+    KeyStep { decoder: with_held(d, held), event: no_event() }
 
 // The step that reports one event, holds nothing, and says whether a
 // paste is open afterwards.
 fn reporting(d: KeyDecoder, e: KeyEvent, paste: Bool) -> KeyStep
-    KeyStep { decoder: KeyDecoder { limits: d.limits, held: [], in_paste: paste },
-              event: Some(e) }
+    KeyStep { decoder: KeyDecoder { limits: d.limits, held: held_new(),
+                                    scan_len: 0, in_paste: paste },
+              event: e }
 
-// The accumulator `feed` adds a step's event to.
-fn with_event(events: [KeyEvent], e: ?KeyEvent) -> [KeyEvent]
-    match e
-        Some(v) => list.push(events, v)
-        None    => events
+// The decoder holding `held` with its cursor back at the ground state,
+// which is what a flush leaves behind.
+fn replaying(d: KeyDecoder, held: KeyHeld) -> KeyDecoder
+    KeyDecoder { limits: d.limits, held: held, scan_len: 0,
+                 in_paste: d.in_paste }
 
-// Every byte of a list, as one paste byte each.
+// One byte of a flush's replay.
 //
-// A fold rather than `list.map`, which on this toolchain strands one
-// box per element when the lambda builds an enum variant (novo bug
-// memory-perceus/list-map-leaks-a-box-per-element-when-the-lambda-builds-an-enum-variant).
-fn paste_bytes(h: [u8]) -> [KeyEvent]
-    list.fold(h, (events, b) => list.push(events, KeyPasteByte(b as Int)), [])
+// `held[0 .. scan_len)` is what a settled decoder fed the replayed
+// bytes would be holding, and `held[scan_len .. len)` has yet to be
+// read.  One byte moves across per call, which is what keeps a flush
+// bounded work per step rather than a recursion that builds a list.
+fn replay_step(d: KeyDecoder) -> KeyStep
+    let b = held_at(d.held, d.scan_len)
+    if d.scan_len == 0
+        // The ground state.  An ESC opens a sequence and the lead of a
+        // codepoint opens a codepoint; both are held, and everything
+        // else is a key on its own.
+        if b == ESC or utf8_owed(b) > 0
+            return KeyStep { decoder: with_scan(d, 1), event: no_event() }
+        return KeyStep { decoder: replaying(d, held_drop_front(d.held, 1)),
+                         event: ground_key(b, keymodel.no_mods()) }
+    let e = scan(held_prefix(d.held, d.scan_len + 1), d.limits)
+    if e.kind == KEY_EVENT_NONE
+        return KeyStep { decoder: with_scan(d, d.scan_len + 1),
+                         event: no_event() }
+    KeyStep { decoder: KeyDecoder { limits: d.limits,
+                                    held: held_drop_front(d.held, d.scan_len + 1),
+                                    scan_len: 0,
+                                    in_paste: e.kind == KEY_EVENT_PASTE_START },
+              event: e }
+
+// The decoder with its cursor moved and nothing else changed.
+fn with_scan(d: KeyDecoder, n: Int) -> KeyDecoder
+    KeyDecoder { limits: d.limits, held: d.held, scan_len: n,
+                 in_paste: d.in_paste }
 
 // ── the ground state ────────────────────────────────────────────────
 
@@ -400,9 +578,26 @@ fn paste_bytes(h: [u8]) -> [KeyEvent]
 // codepoint and is held with it.  Everything else is a key on its own.
 fn first_byte(d: KeyDecoder, b: Int) -> KeyStep
     if b == ESC or utf8_owed(b) > 0
-        holding(d, [b as u8])
+        holding(d, held_push(held_new(), b))
     else
         reporting(d, ground_key(b, keymodel.no_mods()), false)
+
+// A byte that is not the first of what the decoder is holding.
+//
+// The whole held buffer is read again from the start, and the answer is
+// either that it is still a prefix or that it is complete.  A sequence
+// that has reached the caller's ceiling is reported as unrecognised and
+// dropped, which is what keeps a stream of digits from growing the
+// decoder without bound.
+fn next_byte(d: KeyDecoder, b: Int) -> KeyStep
+    if d.held.len >= d.limits.sequence_bytes_max
+        return reporting(d, byte_event(KEY_EVENT_UNKNOWN_SEQUENCE, b), false)
+    let h = held_push(d.held, b)
+    let e = scan(h, d.limits)
+    if e.kind == KEY_EVENT_NONE
+        holding(d, h)
+    else
+        reporting(d, e, e.kind == KEY_EVENT_PASTE_START)
 
 // The key a byte below 0x80 stands for, with the modifiers already
 // read off the sequence that carried it.
@@ -413,24 +608,36 @@ fn first_byte(d: KeyDecoder, b: Int) -> KeyStep
 // a byte from 0x20 up is the character itself.
 fn ground_key(b: Int, m: keymodel.KeyMods) -> KeyEvent
     if b == 0x09
-        named_with(KeyTab, m)
+        named_with(keymodel.KEY_TAB, m)
     else if b == 0x0D
-        named_with(KeyEnter, m)
+        named_with(keymodel.KEY_ENTER, m)
     else if b == 0x7F
-        named_with(KeyBackspace, m)
+        named_with(keymodel.KEY_BACKSPACE, m)
     else if b < 0x20
-        KeyPressed(KeyStroke { press: KeyChar(keymodel.char_of_control(b) ?? b),
-                               mods: with_ctrl(m), motion: KeyDownEvent })
+        let c = keymodel.char_of_control(b)
+        pressed_event(KeyStroke { press: keymodel.key_char((if c == keymodel.NO_CODEPOINT then b else c)),
+                                  mods: with_ctrl(m),
+                                  motion: keymodel.KEY_DOWN_EVENT })
     else
         char_with(b, m)
 
 // A named key with the modifiers given.
-fn named_with(name: keymodel.KeyName, m: keymodel.KeyMods) -> KeyEvent
-    KeyPressed(KeyStroke { press: KeyNamed(name), mods: m, motion: KeyDownEvent })
+fn named_with(name: Int, m: keymodel.KeyMods) -> KeyEvent
+    pressed_event(KeyStroke { press: keymodel.key_named(name), mods: m,
+                              motion: keymodel.KEY_DOWN_EVENT })
 
 // A character with the modifiers given.
 fn char_with(codepoint: Int, m: keymodel.KeyMods) -> KeyEvent
-    KeyPressed(KeyStroke { press: KeyChar(codepoint), mods: m, motion: KeyDownEvent })
+    pressed_event(KeyStroke { press: keymodel.key_char(codepoint), mods: m,
+                              motion: keymodel.KEY_DOWN_EVENT })
+
+// A press with the modifiers and the motion given, or an unrecognised
+// sequence where the press names nothing.
+fn press_event(p: keymodel.KeyPress, m: keymodel.KeyMods, motion: Int, f: Int) -> KeyEvent
+    if p.kind == keymodel.KEY_PRESS_NONE
+        byte_event(KEY_EVENT_UNKNOWN_SEQUENCE, f)
+    else
+        pressed_event(KeyStroke { press: p, mods: m, motion: motion })
 
 // The same modifier set with ctrl held.
 fn with_ctrl(m: keymodel.KeyMods) -> keymodel.KeyMods
@@ -447,38 +654,12 @@ fn mods_with(param: Int, alt: Bool) -> keymodel.KeyMods
 
 // ── the bytes of a sequence ─────────────────────────────────────────
 
-// KeyScan is how far the held bytes have got.
-enum KeyScan
-    // The bytes so far are the start of something, and another byte
-    // decides what.
-    KeyScanMore
-    // The bytes are one complete thing.
-    KeyScanDone(event: KeyEvent)
-
-// A byte that is not the first of what the decoder is holding.
-//
-// The whole held buffer is read again from the start, and the answer is
-// either that it is still a prefix or that it is complete.  A sequence
-// longer than the caller's ceiling is reported as unrecognised and
-// dropped, which is what keeps a stream of digits from growing the
-// decoder without bound.
-fn next_byte(d: KeyDecoder, b: Int) -> KeyStep
-    let h = list.push(d.held, b as u8)
-    if list.len(h) > d.limits.sequence_bytes_max
-        return reporting(d, KeyUnknownSequence(b), false)
-    match scan(h, d.limits)
-        KeyScanMore    => holding(d, h)
-        KeyScanDone(e) => reporting(d, e, is_paste_start(e))
-
-// Whether an event opens a bracketed paste.
-fn is_paste_start(e: KeyEvent) -> Bool
-    match e
-        KeyPasteStart => true
-        _             => false
-
 // The held bytes, read from the start.
-fn scan(h: [u8], limits: KeyLimits) -> KeyScan
-    if byte_at(h, 0) == ESC
+//
+// The answer is the event they complete, or `KEY_EVENT_NONE` where they
+// are still the start of something and another byte decides what.
+fn scan(h: KeyHeld, limits: KeyLimits) -> KeyEvent
+    if held_at(h, 0) == ESC
         scan_esc(h, 0, false, limits)
     else
         scan_utf8(h, 0, keymodel.no_mods())
@@ -489,10 +670,10 @@ fn scan(h: [u8], limits: KeyLimits) -> KeyScan
 // terminal spells Alt and a letter.  An ESC in front of a sequence is
 // the alt prefix of that sequence, so `alt` carries down to the CSI and
 // the SS3 forms and `ESC ESC [ A` is Alt and the up arrow.
-fn scan_esc(h: [u8], i: Int, alt: Bool, limits: KeyLimits) -> KeyScan
-    if i + 1 >= list.len(h)
-        return KeyScanMore
-    let b = byte_at(h, i + 1)
+fn scan_esc(h: KeyHeld, i: Int, alt: Bool, limits: KeyLimits) -> KeyEvent
+    if i + 1 >= h.len
+        return no_event()
+    let b = held_at(h, i + 1)
     if b == ESC
         scan_esc(h, i + 1, true, limits)
     else if b == CSI_OPEN
@@ -502,7 +683,7 @@ fn scan_esc(h: [u8], i: Int, alt: Bool, limits: KeyLimits) -> KeyScan
     else if utf8_owed(b) > 0
         scan_utf8(h, i + 1, mods_with(1, true))
     else
-        KeyScanDone(ground_key(b, mods_with(1, true)))
+        ground_key(b, mods_with(1, true))
 
 // ── UTF-8 ───────────────────────────────────────────────────────────
 //
@@ -544,15 +725,15 @@ fn utf8_head(lead: Int, owed: Int) -> Int
 // produces, and the character it decodes to is as good an answer as
 // any; checking would cost the decoder the ability to report the bytes
 // it had already taken.
-fn scan_utf8(h: [u8], i: Int, m: keymodel.KeyMods) -> KeyScan
-    let lead = byte_at(h, i)
+fn scan_utf8(h: KeyHeld, i: Int, m: keymodel.KeyMods) -> KeyEvent
+    let lead = held_at(h, i)
     let owed = utf8_owed(lead)
-    if i + owed >= list.len(h)
-        return KeyScanMore
+    if i + owed >= h.len
+        return no_event()
     var v = utf8_head(lead, owed)
     for k in 1..owed + 1
-        v = v * 64 + (byte_at(h, i + k) & 0x3F)
-    KeyScanDone(char_with(v, m))
+        v = v * 64 + (held_at(h, i + k) & 0x3F)
+    char_with(v, m)
 
 // ── SS3, which is `ESC O` and one byte ──────────────────────────────
 
@@ -560,244 +741,230 @@ fn scan_utf8(h: [u8], i: Int, m: keymodel.KeyMods) -> KeyScan
 //
 // The four function keys, the four arrows, Home and End, and the keypad
 // as a VT100 sends it in application mode.
-fn scan_ss3(h: [u8], i: Int, alt: Bool) -> KeyScan
-    if i >= list.len(h)
-        return KeyScanMore
-    let b = byte_at(h, i)
-    let m = mods_with(1, alt)
-    match ss3_key(b)
-        Some(press) => KeyScanDone(KeyPressed(KeyStroke { press: press, mods: m,
-                                                          motion: KeyDownEvent }))
-        None        => KeyScanDone(KeyUnknownSequence(b))
+fn scan_ss3(h: KeyHeld, i: Int, alt: Bool) -> KeyEvent
+    if i >= h.len
+        return no_event()
+    let b = held_at(h, i)
+    press_event(ss3_key(b), mods_with(1, alt), keymodel.KEY_DOWN_EVENT, b)
 
-// The press `ESC O <byte>` names, or `None` for a byte that names none.
-fn ss3_key(b: Int) -> ?keymodel.KeyPress
+// The press `ESC O <byte>` names, or the press that names nothing.
+fn ss3_key(b: Int) -> keymodel.KeyPress
     if b >= 'P' and b <= 'S'
-        Some(KeyNamed(KeyFunction(1 + b - 'P')))
+        keymodel.key_function(1 + b - 'P')
     else if b >= 'A' and b <= 'D'
-        Some(KeyNamed(arrow_of(b)))
+        keymodel.key_named(arrow_of(b))
     else if b == 'H'
-        Some(KeyNamed(KeyHome))
+        keymodel.key_named(keymodel.KEY_HOME)
     else if b == 'F'
-        Some(KeyNamed(KeyEnd))
+        keymodel.key_named(keymodel.KEY_END)
     else if b == 'E'
-        Some(KeyPad(KeyPadBegin))
+        keymodel.key_pad(keymodel.KEYPAD_BEGIN)
     else if b == 'M'
-        Some(KeyPad(KeyPadEnter))
+        keymodel.key_pad(keymodel.KEYPAD_ENTER)
     else if b == 'X'
-        Some(KeyPad(KeyPadEqual))
+        keymodel.key_pad(keymodel.KEYPAD_EQUAL)
     else if b >= 'p' and b <= 'y'
-        Some(KeyPad(KeyPadDigit(b - 'p')))
+        keymodel.key_pad_digit(b - 'p')
     else
         pad_operator(b)
 
 // The keypad operators a VT100 sends in application mode, which are the
 // four arithmetic keys and the decimal point.
-fn pad_operator(b: Int) -> ?keymodel.KeyPress
+fn pad_operator(b: Int) -> keymodel.KeyPress
     if b == 'j'
-        Some(KeyPad(KeyPadStar))
+        keymodel.key_pad(keymodel.KEYPAD_STAR)
     else if b == 'k'
-        Some(KeyPad(KeyPadPlus))
+        keymodel.key_pad(keymodel.KEYPAD_PLUS)
     else if b == 'm'
-        Some(KeyPad(KeyPadMinus))
+        keymodel.key_pad(keymodel.KEYPAD_MINUS)
     else if b == 'n'
-        Some(KeyPad(KeyPadDot))
+        keymodel.key_pad(keymodel.KEYPAD_DOT)
     else if b == 'o'
-        Some(KeyPad(KeyPadSlash))
+        keymodel.key_pad(keymodel.KEYPAD_SLASH)
     else
-        None
+        keymodel.no_press()
 
 // The arrow `A` to `D` names.
-fn arrow_of(b: Int) -> keymodel.KeyName
+fn arrow_of(b: Int) -> Int
     if b == 'A'
-        KeyUp
+        keymodel.KEY_UP
     else if b == 'B'
-        KeyDown
+        keymodel.KEY_DOWN
     else if b == 'C'
-        KeyRight
+        keymodel.KEY_RIGHT
     else
-        KeyLeft
+        keymodel.KEY_LEFT
 
 // ── CSI ─────────────────────────────────────────────────────────────
 
-// KeyCsi is a control sequence read as far as the bytes allow: its
-// parameters, the private marker it opened with, and the final byte
-// that ended it.
+// KeyCsi is a control sequence read as far as the bytes allow: where
+// its parameters start and end, the private marker it opened with, the
+// final byte that ended it, and how many semicolon-separated groups it
+// carries.
 //
-// The parameters are a flat list and a group number each, exactly as
-// ansi-nv's parser keeps them.  Colon-separated entries share a group
-// and semicolon-separated ones do not, so `99 ; 1 : 3` is groups
-// `0 1 1`.  A nested list per sequence would be an allocation per
-// keystroke.
+// The parameters are not collected.  They are read back out of the held
+// bytes on demand by `param`, which costs one walk of at most
+// `SEQUENCE_BYTES_CAP` bytes per lookup and at most three lookups per
+// sequence.  A list of them would be a heap cell per keystroke, and a
+// `@value` struct may not hold one.
+@value
 struct KeyCsi
-    values: [Int]
-    groups: [Int]
+    // The first byte of the parameters, which is after `ESC [` and
+    // after the private marker where there is one.
+    body: Int
+    // The index of the final byte.
+    last: Int
     private: Int
     final_byte: Int
     complete: Bool
+    groups: Int
 
 // The body of a CSI at `i`, which is everything after `ESC [`.
 //
 // `CSI M` is read before this and never reaches it, because the X10
 // mouse encoding puts three raw bytes after the final byte and a
 // parameter scanner would read a coordinate of 59 as a separator.
-fn scan_csi(h: [u8], i: Int, alt: Bool, limits: KeyLimits) -> KeyScan
-    let n = list.len(h)
-    if i >= n
-        return KeyScanMore
-    if byte_at(h, i) == 'M'
+fn scan_csi(h: KeyHeld, i: Int, alt: Bool, limits: KeyLimits) -> KeyEvent
+    if i >= h.len
+        return no_event()
+    if held_at(h, i) == 'M'
         return scan_x10(h, i + 1)
     let c = read_csi(h, i)
     if c.complete == false
-        return KeyScanMore
-    KeyScanDone(csi_event(c, alt, limits))
+        return no_event()
+    csi_event(h, c, alt, limits)
 
 // The three raw bytes of an X10 mouse report, which follow `CSI M`.
-fn scan_x10(h: [u8], i: Int) -> KeyScan
-    if i + 2 >= list.len(h)
-        return KeyScanMore
-    match mousedecode.report_x10(byte_at(h, i), byte_at(h, i + 1), byte_at(h, i + 2))
-        Some(r) => KeyScanDone(KeyMouse(r))
-        None    => KeyScanDone(KeyUnknownSequence('M'))
+fn scan_x10(h: KeyHeld, i: Int) -> KeyEvent
+    if i + 2 >= h.len
+        return no_event()
+    let r = mousedecode.report_x10(held_at(h, i), held_at(h, i + 1),
+                                   held_at(h, i + 2))
+    if mousedecode.is_report(r)
+        mouse_event(r)
+    else
+        byte_event(KEY_EVENT_UNKNOWN_SEQUENCE, 'M')
 
-// The parameters, the private marker and the final byte of a CSI.
+// Where the parameters of a CSI start and end, its private marker, its
+// final byte and its group count.
 //
-// A byte that is none of those is collected and ignored, which is what
-// an intermediate byte is: the sequence still ends at its final byte,
-// and a form this package does not claim is reported by that byte.
-fn read_csi(h: [u8], i: Int) -> KeyCsi
-    let n = list.len(h)
-    var values: [Int] = []
-    var groups: [Int] = []
+// A byte that is none of those is walked over and ignored, which is
+// what an intermediate byte is: the sequence still ends at its final
+// byte, and a form this package does not claim is reported by that
+// byte.
+fn read_csi(h: KeyHeld, i: Int) -> KeyCsi
+    var body = i
     var private = 0
-    var start = i
-    if byte_at(h, i) >= '<' and byte_at(h, i) <= '?'
-        private = byte_at(h, i)
-        start = i + 1
-    for k in start..n
-        let b = byte_at(h, k)
-        if b >= '0' and b <= '9'
-            let opened = open_slot(values, groups)
-            values = opened.values
-            groups = opened.groups
-            values = with_digit(values, b - '0')
-        else if b == ';'
-            let opened = open_slot(values, groups)
-            values = list.push(opened.values, PARAM_EMPTY)
-            groups = list.push(opened.groups, next_group(opened.groups))
-        else if b == ':'
-            let opened = open_slot(values, groups)
-            values = list.push(opened.values, PARAM_EMPTY)
-            groups = list.push(opened.groups, last_group(opened.groups))
-        else if b >= '@' and b <= '~'
-            return KeyCsi { values: values, groups: groups, private: private,
-                            final_byte: b, complete: true }
-    KeyCsi { values: values, groups: groups, private: private, final_byte: 0,
-             complete: false }
+    if held_at(h, i) >= '<' and held_at(h, i) <= '?'
+        private = held_at(h, i)
+        body = i + 1
+    for k in body..h.len
+        let b = held_at(h, k)
+        if b >= '@' and b <= '~'
+            return KeyCsi { body: body, last: k, private: private,
+                            final_byte: b, complete: true,
+                            groups: group_count(h, body, k) }
+    KeyCsi { body: body, last: h.len, private: private, final_byte: 0,
+             complete: false, groups: 0 }
 
-// KeySlots is a parameter list part-way through being read.
-struct KeySlots
-    values: [Int]
-    groups: [Int]
+// Whether a byte is part of a parameter list, which is a digit or one
+// of the two separators.
+fn is_param_byte(b: Int) -> Bool
+    b >= '0' and b <= '9' or b == ';' or b == ':'
 
-// The parameter list with a slot open to write into.
+// How many semicolon-separated groups the parameters carry.
 //
-// A separator that arrives before any digit opens the slot it
-// terminated, which is what keeps the first parameter of `CSI ; 5 H` an
-// absence rather than a zero.
-fn open_slot(values: [Int], groups: [Int]) -> KeySlots
-    if list.len(values) > 0
-        KeySlots { values: values, groups: groups }
+// A sequence with no parameter byte at all carries none, which is what
+// tells `CSI M` apart from the urxvt mouse report that ends in the same
+// byte.  Every other parameter list has one group more than it has
+// semicolons, so `; 5` has two exactly as `1 ; 5` does, and
+// colon-separated entries share a group, so `99 ; 1 : 3` has two.
+fn group_count(h: KeyHeld, body: Int, last: Int) -> Int
+    var semicolons = 0
+    var any = false
+    for k in body..last
+        let b = held_at(h, k)
+        if is_param_byte(b)
+            any = true
+        if b == ';'
+            semicolons = semicolons + 1
+    if any
+        semicolons + 1
     else
-        KeySlots { values: list.push(values, PARAM_EMPTY),
-                   groups: list.push(groups, 0) }
-
-// One more digit on the last slot of the list.
-//
-// A parameter stops growing at `PARAM_MAX`.  A sequence carrying a
-// longer run of digits names no key, and the number it stops at is one
-// no form here claims, so the sequence is reported by its final byte.
-fn with_digit(values: [Int], d: Int) -> [Int]
-    let last = list.get(values, list.len(values) - 1)
-    let v = if last == PARAM_EMPTY
-        d
-    else if last > PARAM_MAX
-        last
-    else
-        last * 10 + d
-    list.push(list.slice(values, 0, list.len(values) - 1), v)
-
-// The group the last slot belongs to.
-fn last_group(groups: [Int]) -> Int
-    list.get(groups, list.len(groups) - 1)
-
-// The group a semicolon opens, which is the one after the last.
-fn next_group(groups: [Int]) -> Int
-    last_group(groups) + 1
-
-// Where group `g` starts in the flat list, or -1 when the sequence has
-// no such group.
-fn group_start(groups: [Int], g: Int) -> Int
-    for k in 0..list.len(groups)
-        if list.get(groups, k) == g
-            return k
-    0 - 1
-
-// How many groups a parameter list has.
-fn group_count(c: KeyCsi) -> Int
-    if list.len(c.groups) == 0
         0
-    else
-        last_group(c.groups) + 1
 
 // Entry `sub` of group `g`, or `fallback` where the sequence left it
 // out.
-fn param(c: KeyCsi, g: Int, sub: Int, fallback: Int) -> Int
-    let start = group_start(c.groups, g)
-    if start < 0
-        return fallback
-    let i = start + sub
-    if i >= list.len(c.groups) or (list.get(c.groups, i) == g) == false
-        return fallback
-    let v = list.get(c.values, i)
-    if v == PARAM_EMPTY
-        fallback
-    else
-        v
+//
+// The parameters are read out of the held bytes each time rather than
+// collected once, which is the trade a `@value` decoder makes: a walk
+// of at most `SEQUENCE_BYTES_CAP` bytes instead of a heap cell per
+// keystroke.  A single parameter stops growing at `PARAM_MAX` rather
+// than wrapping; the number it stops at is one no form here claims, so
+// the sequence is reported by its final byte.
+fn param(h: KeyHeld, c: KeyCsi, g: Int, sub: Int, fallback: Int) -> Int
+    var group = 0
+    var entry = 0
+    var value = PARAM_EMPTY
+    for k in c.body..c.last
+        let b = held_at(h, k)
+        if b >= '0' and b <= '9'
+            value = if value == PARAM_EMPTY
+                b - '0'
+            else if value > PARAM_MAX
+                value
+            else
+                value * 10 + (b - '0')
+        else if b == ';' or b == ':'
+            if group == g and entry == sub
+                return if value == PARAM_EMPTY then fallback else value
+            if b == ';'
+                group = group + 1
+                entry = 0
+            else
+                entry = entry + 1
+            value = PARAM_EMPTY
+    if group == g and entry == sub and value != PARAM_EMPTY
+        return value
+    fallback
 
 // The event a complete CSI describes.
-fn csi_event(c: KeyCsi, alt: Bool, limits: KeyLimits) -> KeyEvent
+fn csi_event(h: KeyHeld, c: KeyCsi, alt: Bool, limits: KeyLimits) -> KeyEvent
     let f = c.final_byte
     if c.private == '<'
-        sgr_mouse(c, f)
-    else if f == 'M' and group_count(c) >= 3
-        urxvt_mouse(c)
+        sgr_mouse(h, c, f)
+    else if f == 'M' and c.groups >= 3
+        urxvt_mouse(h, c)
     else if f == 'u'
-        kitty_event(c, alt, limits)
+        kitty_event(h, c, alt, limits)
     else if f == '~'
-        tilde_event(c, alt)
+        tilde_event(h, c, alt)
     else if f == 'I'
-        KeyFocusGained
+        marker_event(KEY_EVENT_FOCUS_GAINED)
     else if f == 'O'
-        KeyFocusLost
+        marker_event(KEY_EVENT_FOCUS_LOST)
     else
-        csi_key(c, f, alt)
+        csi_key(h, c, f, alt)
 
 // The mouse report of an SGR sequence, `CSI < <button> ; <col> ; <row>`
 // and a final byte that says press or release.
-fn sgr_mouse(c: KeyCsi, f: Int) -> KeyEvent
-    match mousedecode.report_sgr(param(c, 0, 0, 0), param(c, 1, 0, 0),
-                                 param(c, 2, 0, 0), f)
-        Some(r) => KeyMouse(r)
-        None    => KeyUnknownSequence(f)
+fn sgr_mouse(h: KeyHeld, c: KeyCsi, f: Int) -> KeyEvent
+    let r = mousedecode.report_sgr(param(h, c, 0, 0, 0), param(h, c, 1, 0, 0),
+                                   param(h, c, 2, 0, 0), f)
+    if mousedecode.is_report(r)
+        mouse_event(r)
+    else
+        byte_event(KEY_EVENT_UNKNOWN_SEQUENCE, f)
 
 // The mouse report of an urxvt sequence, whose first parameter carries
 // the offset X10 adds.
-fn urxvt_mouse(c: KeyCsi) -> KeyEvent
-    match mousedecode.report_urxvt(param(c, 0, 0, 0), param(c, 1, 0, 0),
-                                   param(c, 2, 0, 0))
-        Some(r) => KeyMouse(r)
-        None    => KeyUnknownSequence('M')
+fn urxvt_mouse(h: KeyHeld, c: KeyCsi) -> KeyEvent
+    let r = mousedecode.report_urxvt(param(h, c, 0, 0, 0), param(h, c, 1, 0, 0),
+                                     param(h, c, 2, 0, 0))
+    if mousedecode.is_report(r)
+        mouse_event(r)
+    else
+        byte_event(KEY_EVENT_UNKNOWN_SEQUENCE, 'M')
 
 // The key a CSI ending in a letter names.
 //
@@ -805,32 +972,28 @@ fn urxvt_mouse(c: KeyCsi) -> KeyEvent
 // parameter in the second group.  `CSI R` is not a key: it is the reply
 // to a cursor position query, and this package reports it as
 // unrecognised so that the program which asked can read it.
-fn csi_key(c: KeyCsi, f: Int, alt: Bool) -> KeyEvent
-    let m = mods_with(param(c, 1, 0, 1), alt)
-    let motion = kitty_motion(param(c, 1, 1, 1))
-    match csi_press(f)
-        Some(press) => KeyPressed(KeyStroke { press: press, mods: m, motion: motion })
-        None        => KeyUnknownSequence(f)
+fn csi_key(h: KeyHeld, c: KeyCsi, f: Int, alt: Bool) -> KeyEvent
+    press_event(csi_press(f), mods_with(param(h, c, 1, 0, 1), alt),
+                kitty_motion(param(h, c, 1, 1, 1)), f)
 
-// The press a CSI's final byte names, or `None` for a byte that names
-// no key.
-fn csi_press(f: Int) -> ?keymodel.KeyPress
+// The press a CSI's final byte names, or the press that names nothing.
+fn csi_press(f: Int) -> keymodel.KeyPress
     if f >= 'A' and f <= 'D'
-        Some(KeyNamed(arrow_of(f)))
+        keymodel.key_named(arrow_of(f))
     else if f == 'H'
-        Some(KeyNamed(KeyHome))
+        keymodel.key_named(keymodel.KEY_HOME)
     else if f == 'F'
-        Some(KeyNamed(KeyEnd))
+        keymodel.key_named(keymodel.KEY_END)
     else if f == 'E'
-        Some(KeyPad(KeyPadBegin))
+        keymodel.key_pad(keymodel.KEYPAD_BEGIN)
     else if f == 'Z'
-        Some(KeyNamed(KeyBackTab))
+        keymodel.key_named(keymodel.KEY_BACK_TAB)
     else if f == 'P' or f == 'Q'
-        Some(KeyNamed(KeyFunction(1 + f - 'P')))
+        keymodel.key_function(1 + f - 'P')
     else if f == 'S'
-        Some(KeyNamed(KeyFunction(4)))
+        keymodel.key_function(4)
     else
-        None
+        keymodel.no_press()
 
 // The event a CSI ending in `~` describes.
 //
@@ -838,84 +1001,79 @@ fn csi_press(f: Int) -> ?keymodel.KeyPress
 // two ends of a bracketed paste rather than keys.  27 is xterm's
 // modifyOtherKeys form, where the modifiers are the second parameter
 // and the codepoint is the third.
-fn tilde_event(c: KeyCsi, alt: Bool) -> KeyEvent
-    let n = param(c, 0, 0, 0)
+fn tilde_event(h: KeyHeld, c: KeyCsi, alt: Bool) -> KeyEvent
+    let n = param(h, c, 0, 0, 0)
     if n == PASTE_START_PARAM
-        KeyPasteStart
+        marker_event(KEY_EVENT_PASTE_START)
     else if n == PASTE_END_PARAM
-        KeyPasteEnd
+        marker_event(KEY_EVENT_PASTE_END)
     else if n == MODIFY_OTHER_PARAM
-        ground_key(param(c, 2, 0, 0), mods_with(param(c, 1, 0, 1), alt))
+        ground_key(param(h, c, 2, 0, 0), mods_with(param(h, c, 1, 0, 1), alt))
     else
-        tilde_key(c, n, alt)
+        tilde_key(h, c, n, alt)
 
 // The named key a tilde number stands for, from xterm's `ctlseqs`,
 // "PC-Style Function Keys".
-fn tilde_event_name(n: Int) -> ?keymodel.KeyName
+fn tilde_event_name(n: Int) -> keymodel.KeyPress
     if n == 1 or n == 7
-        Some(KeyHome)
+        keymodel.key_named(keymodel.KEY_HOME)
     else if n == 2
-        Some(KeyInsert)
+        keymodel.key_named(keymodel.KEY_INSERT)
     else if n == 3
-        Some(KeyDelete)
+        keymodel.key_named(keymodel.KEY_DELETE)
     else if n == 4 or n == 8
-        Some(KeyEnd)
+        keymodel.key_named(keymodel.KEY_END)
     else if n == 5
-        Some(KeyPageUp)
+        keymodel.key_named(keymodel.KEY_PAGE_UP)
     else if n == 6
-        Some(KeyPageDown)
+        keymodel.key_named(keymodel.KEY_PAGE_DOWN)
     else
         tilde_function(n)
 
 // The function key a tilde number stands for.  The numbers run in five
 // runs with gaps between them, because the terminals that defined them
 // left room each time.
-fn tilde_function(n: Int) -> ?keymodel.KeyName
+fn tilde_function(n: Int) -> keymodel.KeyPress
     if n >= 11 and n <= 15
-        Some(KeyFunction(n - 10))
+        keymodel.key_function(n - 10)
     else if n >= 17 and n <= 21
-        Some(KeyFunction(n - 11))
+        keymodel.key_function(n - 11)
     else if n >= 23 and n <= 26
-        Some(KeyFunction(n - 12))
+        keymodel.key_function(n - 12)
     else if n >= 28 and n <= 29
-        Some(KeyFunction(n - 13))
+        keymodel.key_function(n - 13)
     else if n >= 31 and n <= 34
-        Some(KeyFunction(n - 14))
+        keymodel.key_function(n - 14)
     else
-        None
+        keymodel.no_press()
 
 // One tilde form, with its modifier parameter.
-fn tilde_key(c: KeyCsi, n: Int, alt: Bool) -> KeyEvent
-    match tilde_event_name(n)
-        Some(name) => KeyPressed(KeyStroke { press: KeyNamed(name),
-                                             mods: mods_with(param(c, 1, 0, 1), alt),
-                                             motion: kitty_motion(param(c, 1, 1, 1)) })
-        None       => KeyUnknownSequence('~')
+fn tilde_key(h: KeyHeld, c: KeyCsi, n: Int, alt: Bool) -> KeyEvent
+    press_event(tilde_event_name(n), mods_with(param(h, c, 1, 0, 1), alt),
+                kitty_motion(param(h, c, 1, 1, 1)), '~')
 
 // ── the kitty keyboard protocol ─────────────────────────────────────
 
 // The event a `CSI <codepoint> ; <mods> : <event> u` sequence
 // describes, or an unrecognised sequence when the caller turned the
 // kitty forms off.
-fn kitty_event(c: KeyCsi, alt: Bool, limits: KeyLimits) -> KeyEvent
+fn kitty_event(h: KeyHeld, c: KeyCsi, alt: Bool, limits: KeyLimits) -> KeyEvent
     if limits.kitty_enabled == false
-        return KeyUnknownSequence('u')
-    let m = mods_with(param(c, 1, 0, 1), alt)
-    let motion = kitty_motion(param(c, 1, 1, 1))
-    match kitty_press(param(c, 0, 0, 0))
-        Some(press) => KeyPressed(KeyStroke { press: press, mods: m, motion: motion })
-        None        => KeyUnknownSequence('u')
+        return byte_event(KEY_EVENT_UNKNOWN_SEQUENCE, 'u')
+    press_event(kitty_press(param(h, c, 0, 0, 0)),
+                mods_with(param(h, c, 1, 0, 1), alt),
+                kitty_motion(param(h, c, 1, 1, 1)), 'u')
 
 // Whether the key went down, repeated or came up, from the event type
 // the kitty protocol puts after the modifiers.  See the kitty keyboard
 // protocol, "Event types".
-fn kitty_motion(event: Int) -> keymodel.KeyMotion
+fn kitty_motion(event: Int) -> Int
     if event == KITTY_RELEASE
-        KeyUpEvent
+        keymodel.KEY_UP_EVENT
     else if event == KITTY_REPEAT
-        KeyRepeatEvent
+        keymodel.KEY_REPEAT_EVENT
     else
-        KeyDownEvent
+        keymodel.KEY_DOWN_EVENT
 
 // The press a kitty codepoint names.
 //
@@ -923,17 +1081,17 @@ fn kitty_motion(event: Int) -> keymodel.KeyMotion
 // type with no modifiers, except for the four that have a name.  From
 // 57344 upwards it is a functional key, and the protocol's own table
 // says which.
-fn kitty_press(n: Int) -> ?keymodel.KeyPress
+fn kitty_press(n: Int) -> keymodel.KeyPress
     if n == 0x0D
-        Some(KeyNamed(KeyEnter))
+        keymodel.key_named(keymodel.KEY_ENTER)
     else if n == 0x09
-        Some(KeyNamed(KeyTab))
+        keymodel.key_named(keymodel.KEY_TAB)
     else if n == ESC
-        Some(KeyNamed(KeyEscape))
+        keymodel.key_named(keymodel.KEY_ESCAPE)
     else if n == 0x7F
-        Some(KeyNamed(KeyBackspace))
+        keymodel.key_named(keymodel.KEY_BACKSPACE)
     else if n < KITTY_FUNCTIONAL
-        Some(KeyChar(n))
+        keymodel.key_char(n)
     else
         kitty_functional(n)
 
@@ -942,84 +1100,99 @@ fn kitty_press(n: Int) -> ?keymodel.KeyPress
 //
 // The numbers this package does not name are the modifier keys
 // themselves, the keypad keys that duplicate a named key, and three
-// media keys with no variant in `KeyName`.  A sequence carrying one of
+// media keys with no name in `keymodel`.  A sequence carrying one of
 // those is reported as unrecognised rather than folded onto a key it is
 // not.
-fn kitty_functional(n: Int) -> ?keymodel.KeyPress
+fn kitty_functional(n: Int) -> keymodel.KeyPress
     if n >= 57358 and n <= 57363
-        Some(KeyNamed(kitty_lock_key(n)))
+        keymodel.key_named(kitty_lock_key(n))
     else if n >= 57376 and n <= 57398
-        Some(KeyNamed(KeyFunction(13 + n - 57376)))
+        keymodel.key_function(13 + n - 57376)
     else if n >= 57399 and n <= 57408
-        Some(KeyPad(KeyPadDigit(n - 57399)))
+        keymodel.key_pad_digit(n - 57399)
     else if n >= 57409 and n <= 57415
-        Some(KeyPad(kitty_pad_key(n)))
+        keymodel.key_pad(kitty_pad_key(n))
     else if n == 57427
-        Some(KeyPad(KeyPadBegin))
+        keymodel.key_pad(keymodel.KEYPAD_BEGIN)
     else
         kitty_media(n)
 
 // The six keys the kitty protocol numbers 57358 to 57363, which are the
 // three lock keys, the print screen key, pause and menu.
-fn kitty_lock_key(n: Int) -> keymodel.KeyName
+fn kitty_lock_key(n: Int) -> Int
     if n == 57358
-        KeyCapsLock
+        keymodel.KEY_CAPS_LOCK
     else if n == 57359
-        KeyScrollLock
+        keymodel.KEY_SCROLL_LOCK
     else if n == 57360
-        KeyNumLock
+        keymodel.KEY_NUM_LOCK
     else if n == 57361
-        KeyPrintScreen
+        keymodel.KEY_PRINT_SCREEN
     else if n == 57362
-        KeyPause
+        keymodel.KEY_PAUSE
     else
-        KeyMenu
+        keymodel.KEY_MENU
 
 // The seven keypad keys the kitty protocol numbers 57409 to 57415,
 // which are the decimal point, the four operators, the keypad's own
 // Enter and its equals key.
-fn kitty_pad_key(n: Int) -> keymodel.KeyPadKey
+fn kitty_pad_key(n: Int) -> Int
     if n == 57409
-        KeyPadDot
+        keymodel.KEYPAD_DOT
     else if n == 57410
-        KeyPadSlash
+        keymodel.KEYPAD_SLASH
     else if n == 57411
-        KeyPadStar
+        keymodel.KEYPAD_STAR
     else if n == 57412
-        KeyPadMinus
+        keymodel.KEYPAD_MINUS
     else if n == 57413
-        KeyPadPlus
+        keymodel.KEYPAD_PLUS
     else if n == 57414
-        KeyPadEnter
+        keymodel.KEYPAD_ENTER
     else
-        KeyPadEqual
+        keymodel.KEYPAD_EQUAL
 
 // The media and volume keys, which only the kitty protocol reports.
-fn kitty_media(n: Int) -> ?keymodel.KeyPress
+fn kitty_media(n: Int) -> keymodel.KeyPress
     if n == 57428
-        Some(KeyNamed(KeyMediaPlay))
+        keymodel.key_named(keymodel.KEY_MEDIA_PLAY)
     else if n == 57429
-        Some(KeyNamed(KeyMediaPauseKey))
+        keymodel.key_named(keymodel.KEY_MEDIA_PAUSE)
     else if n == 57432
-        Some(KeyNamed(KeyMediaStop))
+        keymodel.key_named(keymodel.KEY_MEDIA_STOP)
     else if n == 57435
-        Some(KeyNamed(KeyMediaNext))
+        keymodel.key_named(keymodel.KEY_MEDIA_NEXT)
     else if n == 57436
-        Some(KeyNamed(KeyMediaPrev))
+        keymodel.key_named(keymodel.KEY_MEDIA_PREV)
     else if n == 57438
-        Some(KeyNamed(KeyVolumeDown))
+        keymodel.key_named(keymodel.KEY_VOLUME_DOWN)
     else if n == 57439
-        Some(KeyNamed(KeyVolumeUp))
+        keymodel.key_named(keymodel.KEY_VOLUME_UP)
     else if n == 57440
-        Some(KeyNamed(KeyVolumeMute))
+        keymodel.key_named(keymodel.KEY_VOLUME_MUTE)
     else
-        None
+        keymodel.no_press()
 
 // ── a bracketed paste ───────────────────────────────────────────────
 
-// The bytes that close a bracketed paste, which are `CSI 201 ~`.
-fn paste_end_marker() -> [u8]
-    [ESC as u8, '[' as u8, '2' as u8, '0' as u8, '1' as u8, '~' as u8]
+// Byte `i` of the bytes that close a bracketed paste, which are
+// `CSI 201 ~`.
+//
+// `i` is below `PASTE_MARKER_LEN` at every call, because the only
+// caller walks a buffer the marker's own length bounds.
+fn marker_byte(i: Int) -> Int
+    if i == 0
+        ESC
+    else if i == 1
+        '['
+    else if i == 2
+        '2'
+    else if i == 3
+        '0'
+    else if i == 4
+        '1'
+    else
+        '~'
 
 // One byte inside a paste.
 //
@@ -1028,19 +1201,23 @@ fn paste_end_marker() -> [u8]
 // pasted text.  The decoder therefore holds at most the five bytes of a
 // half-arrived marker, and reports every byte it was given, in order.
 fn paste_byte(d: KeyDecoder, b: Int) -> KeyStep
-    let h = list.push(d.held, b as u8)
+    let h = held_push(d.held, b)
     if starts_marker(h)
-        if list.len(h) == list.len(paste_end_marker())
-            reporting(d, KeyPasteEnd, false)
+        if h.len == PASTE_MARKER_LEN
+            reporting(d, marker_event(KEY_EVENT_PASTE_END), false)
         else
             holding(d, h)
     else
-        KeyStep { decoder: KeyDecoder { limits: d.limits,
-                                        held: list.slice(h, 1, list.len(h)),
-                                        in_paste: true },
-                  event: Some(KeyPasteByte(byte_at(h, 0))) }
+        KeyStep { decoder: with_held(d, held_drop_front(h, 1)),
+                  event: byte_event(KEY_EVENT_PASTE_BYTE, held_at(h, 0)) }
 
 // Whether the bytes are the first bytes of the end marker.
-fn starts_marker(h: [u8]) -> Bool
-    let marker = paste_end_marker()
-    list.len(h) <= list.len(marker) and list.slice(marker, 0, list.len(h)) == h
+//
+// The buffer is never longer than the marker here: a byte that does not
+// continue it empties the buffer, and the byte that completes it
+// reports the end of the paste.
+fn starts_marker(h: KeyHeld) -> Bool
+    for i in 0..h.len
+        if held_at(h, i) != marker_byte(i)
+            return false
+    true

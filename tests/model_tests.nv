@@ -6,7 +6,7 @@
 // both ways, the button byte's fields, and the three mouse encodings
 // including the inputs each of them refuses.
 //
-// The row on every `@test` is `[io]`, for `test.case` and nothing else.
+// The effect row on every `@test` is `[io]`, for `test.case` and nothing else.
 
 use std.test
 use keymodel
@@ -52,55 +52,33 @@ fn test_the_modifier_parameter_is_written_as_well_as_read() [io]
 @test
 fn test_the_control_byte_mapping_covers_its_domain() [io]
     test.case("the space is the byte 0")
-    match keymodel.control_char(' ')
-        Some(b) => test.assert(b == 0)
-        None    => test.assert(false)
+    test.assert(keymodel.control_char(' ') == 0)
 
     test.case("a letter in either case is the same byte")
-    match keymodel.control_char('c')
-        Some(b) => test.assert(b == 0x03)
-        None    => test.assert(false)
-    match keymodel.control_char('C')
-        Some(b) => test.assert(b == 0x03)
-        None    => test.assert(false)
+    test.assert(keymodel.control_char('c') == 0x03)
+    test.assert(keymodel.control_char('C') == 0x03)
 
     test.case("the digits 4 to 7 are 0x1C to 0x1F")
-    match keymodel.control_char('4')
-        Some(b) => test.assert(b == 0x1C)
-        None    => test.assert(false)
-    match keymodel.control_char('7')
-        Some(b) => test.assert(b == 0x1F)
-        None    => test.assert(false)
+    test.assert(keymodel.control_char('4') == 0x1C)
+    test.assert(keymodel.control_char('7') == 0x1F)
 
     test.case("and a digit outside that run has no control byte")
-    match keymodel.control_char('1')
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(keymodel.control_char('1') == keymodel.NO_CODEPOINT)
 
 @test
 fn test_the_control_byte_mapping_runs_backwards() [io]
     test.case("0 is the space")
-    match keymodel.char_of_control(0)
-        Some(c) => test.assert(c == ' ')
-        None    => test.assert(false)
+    test.assert(keymodel.char_of_control(0) == ' ')
 
     test.case("0x1C to 0x1F are the digits 4 to 7")
-    match keymodel.char_of_control(0x1C)
-        Some(c) => test.assert(c == '4')
-        None    => test.assert(false)
-    match keymodel.char_of_control(0x1F)
-        Some(c) => test.assert(c == '7')
-        None    => test.assert(false)
+    test.assert(keymodel.char_of_control(0x1C) == '4')
+    test.assert(keymodel.char_of_control(0x1F) == '7')
 
     test.case("Escape is a key rather than Ctrl and a bracket")
-    match keymodel.char_of_control(0x1B)
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(keymodel.char_of_control(0x1B) == keymodel.NO_CODEPOINT)
 
     test.case("and a byte that is not a control character has no letter")
-    match keymodel.char_of_control(' ')
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(keymodel.char_of_control(' ') == keymodel.NO_CODEPOINT)
 
 @test
 fn test_a_keystroke_carries_its_press_its_mods_and_its_motion() [io]
@@ -119,185 +97,216 @@ fn test_a_keystroke_carries_its_press_its_mods_and_its_motion() [io]
     test.case("and two modifier sets compare by their fields")
     test.assert(keymodel.mods_eq(keymodel.mods_of(5), keymodel.mods_of(5)))
     test.assert(keymodel.mods_eq(keymodel.mods_of(5), keymodel.no_mods()) == false)
+    test.assert(keymodel.mods_eq(keymodel.mods_of(2), keymodel.mods_of(3)) == false)
+    test.assert(keymodel.mods_eq(keymodel.mods_of(9), keymodel.no_mods()) == false)
+
+@test
+fn test_two_presses_differ_in_any_one_field() [io]
+    test.case("a different name is a different press")
+    test.assert(keymodel.press_eq(keymodel.key_named(keymodel.KEY_UP),
+                                  keymodel.key_named(keymodel.KEY_DOWN)) == false)
+
+    test.case("a different function key number too")
+    test.assert(keymodel.press_eq(keymodel.key_function(5),
+                                  keymodel.key_function(6)) == false)
+
+    test.case("a different keypad key, and a different digit on it")
+    test.assert(keymodel.press_eq(keymodel.key_pad(keymodel.KEYPAD_PLUS),
+                                  keymodel.key_pad(keymodel.KEYPAD_MINUS)) == false)
+    test.assert(keymodel.press_eq(keymodel.key_pad_digit(4),
+                                  keymodel.key_pad_digit(5)) == false)
+
+    test.case("a different press kind too")
+    test.assert(keymodel.press_eq(keymodel.key_pad_digit(5),
+                                  keymodel.key_char('5')) == false)
+
+    test.case("a different character too")
+    test.assert(keymodel.press_eq(keymodel.key_char('a'),
+                                  keymodel.key_char('b')) == false)
+
+    test.case("and the press that names nothing equals only itself")
+    test.assert(keymodel.press_eq(keymodel.no_press(), keymodel.no_press()))
+    test.assert(keymodel.press_eq(keymodel.no_press(),
+                                  keymodel.key_char(0)) == false)
 
 @test
 fn test_two_keystrokes_differ_in_any_one_field() [io]
-    let up = keymodel.named_key(KeyUp)
+    let up = keymodel.named_key(keymodel.KEY_UP)
 
     test.case("a different name is a different keystroke")
-    test.assert(keymodel.stroke_eq(up, keymodel.named_key(KeyDown)) == false)
+    test.assert(keymodel.stroke_eq(up, keymodel.named_key(keymodel.KEY_DOWN))
+                == false)
 
-    test.case("a different function key number too")
-    test.assert(keymodel.stroke_eq(keymodel.named_key(KeyFunction(5)),
-                                   keymodel.named_key(KeyFunction(6))) == false)
+    test.case("the same name is the same keystroke")
+    test.assert(keymodel.stroke_eq(up, keymodel.named_key(keymodel.KEY_UP)))
 
-    test.case("a different press kind too")
-    let pad = KeyStroke { press: KeyPad(KeyPadDigit(5)), mods: keymodel.no_mods(),
-                          motion: KeyDownEvent }
-    test.assert(keymodel.stroke_eq(pad, keymodel.char_key('5')) == false)
+    test.case("a keystroke that names nothing is a keystroke too")
+    test.assert(keymodel.no_stroke().press.kind == keymodel.KEY_PRESS_NONE)
 
     test.case("and a release is not the press of the same key")
-    let released = KeyStroke { press: up.press, mods: up.mods, motion: KeyUpEvent }
+    let released = KeyStroke { press: up.press, mods: up.mods,
+                               motion: keymodel.KEY_UP_EVENT }
     test.assert(keymodel.stroke_eq(up, released) == false)
 
 @test
 fn test_the_button_byte_names_every_button() [io]
     test.case("the four buttons")
-    test.assert(mousedecode.button_code(MouseLeft, keymodel.no_mods(), false) == 0)
-    test.assert(mousedecode.button_code(MouseMiddle, keymodel.no_mods(), false) == 1)
-    test.assert(mousedecode.button_code(MouseRight, keymodel.no_mods(), false) == 2)
-    test.assert(mousedecode.button_code(MouseNoButton, keymodel.no_mods(), false) == 3)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_LEFT, 0,
+                                        keymodel.no_mods(), false) == 0)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_MIDDLE, 0,
+                                        keymodel.no_mods(), false) == 1)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_RIGHT, 0,
+                                        keymodel.no_mods(), false) == 2)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_NO_BUTTON, 0,
+                                        keymodel.no_mods(), false) == 3)
 
     test.case("and they read back")
-    match mousedecode.decode_button(1)
-        MouseMiddle => test.assert(true)
-        _           => test.assert(false)
-    match mousedecode.decode_button(2)
-        MouseRight => test.assert(true)
-        _          => test.assert(false)
-    match mousedecode.decode_button(3)
-        MouseNoButton => test.assert(true)
-        _             => test.assert(false)
+    test.assert(mousedecode.decode_button(0) == mousedecode.MOUSE_LEFT)
+    test.assert(mousedecode.decode_button(1) == mousedecode.MOUSE_MIDDLE)
+    test.assert(mousedecode.decode_button(2) == mousedecode.MOUSE_RIGHT)
+    test.assert(mousedecode.decode_button(3) == mousedecode.MOUSE_NO_BUTTON)
+
+    test.case("an ordinary button carries no extra number")
+    test.assert(mousedecode.decode_button_number(1) == 0)
 
 @test
 fn test_the_button_byte_names_all_four_wheel_directions() [io]
     test.case("the two vertical directions")
-    test.assert(mousedecode.button_code(MouseWheelUp, keymodel.no_mods(), false) == 64)
-    test.assert(mousedecode.button_code(MouseWheelDown, keymodel.no_mods(), false) == 65)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_WHEEL_UP, 0,
+                                        keymodel.no_mods(), false) == 64)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_WHEEL_DOWN, 0,
+                                        keymodel.no_mods(), false) == 65)
 
     test.case("and the two horizontal ones a trackpad sends")
-    test.assert(mousedecode.button_code(MouseWheelLeft, keymodel.no_mods(), false) == 66)
-    test.assert(mousedecode.button_code(MouseWheelRight, keymodel.no_mods(), false) == 67)
-    match mousedecode.decode_button(66)
-        MouseWheelLeft => test.assert(true)
-        _              => test.assert(false)
-    match mousedecode.decode_button(67)
-        MouseWheelRight => test.assert(true)
-        _               => test.assert(false)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_WHEEL_LEFT, 0,
+                                        keymodel.no_mods(), false) == 66)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_WHEEL_RIGHT, 0,
+                                        keymodel.no_mods(), false) == 67)
+    test.assert(mousedecode.decode_button(64) == mousedecode.MOUSE_WHEEL_UP)
+    test.assert(mousedecode.decode_button(65) == mousedecode.MOUSE_WHEEL_DOWN)
+    test.assert(mousedecode.decode_button(66) == mousedecode.MOUSE_WHEEL_LEFT)
+    test.assert(mousedecode.decode_button(67) == mousedecode.MOUSE_WHEEL_RIGHT)
 
 @test
 fn test_the_extra_buttons_are_bit_seven() [io]
     test.case("buttons 8 to 11 go out in the low two bits")
-    test.assert(mousedecode.button_code(MouseExtraButton(8), keymodel.no_mods(), false) == 128)
-    test.assert(mousedecode.button_code(MouseExtraButton(11), keymodel.no_mods(), false) == 131)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_EXTRA_BUTTON, 8,
+                                        keymodel.no_mods(), false) == 128)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_EXTRA_BUTTON, 11,
+                                        keymodel.no_mods(), false) == 131)
 
     test.case("and read back by their number")
-    match mousedecode.decode_button(131)
-        MouseExtraButton(n) => test.assert(n == 11)
-        _                   => test.assert(false)
+    test.assert(mousedecode.decode_button(131) == mousedecode.MOUSE_EXTRA_BUTTON)
+    test.assert(mousedecode.decode_button_number(131) == 11)
+
+    test.case("a report of one carries the number on the report")
+    let r = mousedecode.report_sgr(128, 10, 10, 'M')
+    test.assert(r.button == mousedecode.MOUSE_EXTRA_BUTTON)
+    test.assert(r.button_number == 8)
 
 @test
 fn test_the_modifier_bits_of_the_button_byte() [io]
     test.case("bit 2 is shift, bit 3 is meta, bit 4 is ctrl")
-    let shift = mousedecode.button_code(MouseLeft, keymodel.mods_of(2), false)
+    let shift = mousedecode.button_code(mousedecode.MOUSE_LEFT, 0,
+                                        keymodel.mods_of(2), false)
     test.assert(shift == 4)
     test.assert(mousedecode.decode_mods(shift).shift)
 
-    let meta = mousedecode.button_code(MouseLeft,
-                                       KeyMods { shift: false, alt: false, ctrl: false,
-                                                 meta: true },
-                                                 false)
+    let meta = mousedecode.button_code(mousedecode.MOUSE_LEFT, 0,
+                                       KeyMods { shift: false, alt: false,
+                                                 ctrl: false, meta: true },
+                                       false)
     test.assert(meta == 8)
     test.assert(mousedecode.decode_mods(meta).meta)
+
+    let ctrl = mousedecode.button_code(mousedecode.MOUSE_LEFT, 0,
+                                       keymodel.mods_of(5), false)
+    test.assert(ctrl == 16)
+    test.assert(mousedecode.decode_mods(ctrl).ctrl)
 
     test.case("a mouse report has no alt bit to carry")
     test.assert(mousedecode.decode_mods(8).alt == false)
 
     test.case("and bit 5 is motion")
-    test.assert(mousedecode.button_code(MouseLeft, keymodel.no_mods(), true) == 32)
+    test.assert(mousedecode.button_code(mousedecode.MOUSE_LEFT, 0,
+                                        keymodel.no_mods(), true) == 32)
     test.assert(mousedecode.is_motion(32))
 
 @test
 fn test_the_x10_encoding_refuses_a_byte_below_its_offset() [io]
     test.case("a button byte below 32 is not a report")
-    match mousedecode.report_x10(0, 0x48, 0x2C)
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(mousedecode.is_report(mousedecode.report_x10(0, 0x48, 0x2C))
+                == false)
 
     test.case("nor is a coordinate byte below 32")
-    match mousedecode.report_x10(0x20, 0, 0x2C)
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
-    match mousedecode.report_x10(0x20, 0x48, 0)
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(mousedecode.is_report(mousedecode.report_x10(0x20, 0, 0x2C))
+                == false)
+    test.assert(mousedecode.is_report(mousedecode.report_x10(0x20, 0x48, 0))
+                == false)
+
+    test.case("and the refusal names no encoding")
+    test.assert(mousedecode.no_report().encoding == mousedecode.MOUSE_NO_ENCODING)
 
 @test
 fn test_a_drag_is_a_motion_report() [io]
     // Button 0 held, with the motion bit set: 32 + 0, and the X10
     // offset on top of that.
     test.case("the motion bit makes the action a move")
-    match mousedecode.report_x10(0x20 + 32, 0x48, 0x2C)
-        Some(r) =>
-            match r.action
-                MouseMoved => test.assert(true)
-                _          => test.assert(false)
-            match r.button
-                MouseLeft => test.assert(true)
-                _         => test.assert(false)
-        None    => test.assert(false)
+    let r = mousedecode.report_x10(0x20 + 32, 0x48, 0x2C)
+    test.assert(mousedecode.is_report(r))
+    test.assert(r.action == mousedecode.MOUSE_MOVED)
+    test.assert(r.button == mousedecode.MOUSE_LEFT)
+
+    test.case("and button 3 with no motion bit is a release")
+    let up = mousedecode.report_x10(0x20 + 3, 0x48, 0x2C)
+    test.assert(up.action == mousedecode.MOUSE_RELEASED)
+    test.assert(up.button == mousedecode.MOUSE_NO_BUTTON)
 
 @test
 fn test_the_urxvt_encoding_is_x10_in_parameters() [io]
     test.case("the first parameter carries the offset")
-    match mousedecode.report_urxvt(32, 40, 12)
-        Some(r) =>
-            test.assert(r.col == 40)
-            match r.encoding
-                MouseUrxvtEncoding => test.assert(true)
-                _                  => test.assert(false)
-        None    => test.assert(false)
+    let r = mousedecode.report_urxvt(32, 40, 12)
+    test.assert(mousedecode.is_report(r))
+    test.assert(r.col == 40)
+    test.assert(r.encoding == mousedecode.MOUSE_URXVT_ENCODING)
 
     test.case("a first parameter below 32 is not a report")
-    match mousedecode.report_urxvt(0, 40, 12)
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(mousedecode.is_report(mousedecode.report_urxvt(0, 40, 12)) == false)
 
     test.case("and a coordinate below one is not either")
-    match mousedecode.report_urxvt(32, 0, 12)
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(mousedecode.is_report(mousedecode.report_urxvt(32, 0, 12)) == false)
 
 @test
 fn test_the_sgr_encoding_refuses_what_it_cannot_read() [io]
     test.case("a final byte that is neither M nor m")
-    match mousedecode.report_sgr(0, 40, 12, 'X')
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(mousedecode.is_report(mousedecode.report_sgr(0, 40, 12, 'X'))
+                == false)
 
     test.case("a negative button")
-    match mousedecode.report_sgr(0 - 1, 40, 12, 'M')
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(mousedecode.is_report(mousedecode.report_sgr(0 - 1, 40, 12, 'M'))
+                == false)
 
     test.case("and a coordinate below one, because SGR counts from one")
-    match mousedecode.report_sgr(0, 0, 12, 'M')
-        Some(_) => test.assert(false)
-        None    => test.assert(true)
+    test.assert(mousedecode.is_report(mousedecode.report_sgr(0, 0, 12, 'M'))
+                == false)
 
 @test
 fn test_every_wheel_direction_answers_the_wheel_question() [io]
     test.case("all four say so")
     for code in [64, 65, 66, 67]
-        match mousedecode.report_sgr(code, 10, 10, 'M')
-            Some(r) => test.assert(mousedecode.is_wheel(r))
-            None    => test.assert(false)
+        test.assert(mousedecode.is_wheel(mousedecode.report_sgr(code, 10, 10, 'M')))
 
     test.case("and a middle button does not")
-    match mousedecode.report_sgr(1, 10, 10, 'M')
-        Some(r) => test.assert(mousedecode.is_wheel(r) == false)
-        None    => test.assert(false)
+    test.assert(mousedecode.is_wheel(mousedecode.report_sgr(1, 10, 10, 'M'))
+                == false)
 
 @test
 fn test_the_x10_ceiling_applies_to_the_row_as_well() [io]
     test.case("a row at the ceiling is as inexact as a column")
-    match mousedecode.report_x10(0x20, 0x48, 0xFF)
-        Some(r) =>
-            test.assert(r.row == mousedecode.X10_COORD_MAX)
-            test.assert(mousedecode.coordinates_are_exact(r) == false)
-        None    => test.assert(false)
+    let r = mousedecode.report_x10(0x20, 0x48, 0xFF)
+    test.assert(r.row == mousedecode.X10_COORD_MAX)
+    test.assert(mousedecode.coordinates_are_exact(r) == false)
 
     test.case("and the urxvt encoding has no ceiling to hit")
-    match mousedecode.report_urxvt(32, 400, 400)
-        Some(r) => test.assert(mousedecode.coordinates_are_exact(r))
-        None    => test.assert(false)
+    test.assert(mousedecode.coordinates_are_exact(
+        mousedecode.report_urxvt(32, 400, 400)))
