@@ -5,6 +5,15 @@ All notable changes to keymap-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.2.1 — 2026-09-25
+
+Two test files changed so that they build with novo 0.10.0.  In that
+release `list.push` writes into the list it is given, and a write goes
+through a name declared `var`.  The helper that builds a long escape
+sequence now pushes the last byte and answers the list by its own name.
+The test that feeds thirty digits declares its sequence `var`.  The
+library code and its signatures are unchanged.
+
 ## 0.2.0 — 2026-09-22
 
 A breaking release. The decoder builds and runs on a microcontroller

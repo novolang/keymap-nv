@@ -33,6 +33,7 @@ fn long_sequence() -> [Int]
         if group < 2
             seq = list.push(seq, ';')
     list.push(seq, 'M')
+    seq
 
 // The bytes of a chunk, fed one at a time, with the decoder left over.
 fn feed_all(start: keydecode.KeyDecoder, bytes: [Int]) -> keydecode.KeyDecoder
@@ -77,7 +78,7 @@ fn test_a_parameter_stops_growing_rather_than_wrapping() [io]
     // claims and stops there, and the decoder gives up on the sequence
     // at its ceiling rather than holding more bytes than it has room
     // for.
-    let seq = list.concat([0x1B, '['], list.map(list.range(0, 30), _ => '1'))
+    var seq = list.concat([0x1B, '['], list.map(list.range(0, 30), _ => '1'))
     let out = keychunk.feed(keydecode.decoder_new(),
                             list.map(list.push(seq, 'A'), b => b as u8))
 

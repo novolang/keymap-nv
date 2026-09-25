@@ -202,6 +202,7 @@ fn long_sequence() -> [Int]
         if group < 2
             seq = list.push(seq, ';')
     list.push(seq, 'M')
+    seq
 
 fn main() [io]
     println(str.from_int(model_path() + mouse_path() + decode_path()))
