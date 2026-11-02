@@ -26,6 +26,10 @@ stability   = "experimental"
 # `--opt=0` and none of them calls the allocator.
 layer       = "core"
 
+# `keychunk` answers lists, which the embedded runtime does not define; the
+# three modules the probe builds are the device build.
+host_modules = ["keychunk"]
+
 category    = "terminal"
 
 tags        = ["keyboard", "mouse", "input", "terminal", "crossterm", "kitty-keyboard", "modifyotherkeys", "bracketed-paste", "sans-io", "embedded", "no-alloc"]
