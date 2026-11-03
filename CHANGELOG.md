@@ -5,6 +5,10 @@ All notable changes to keymap-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.2.2 — 2026-11-03
+
+This release requires novo 0.23.0 or later.
+
 ## 0.2.1 — 2026-09-25
 
 Two test files changed so that they build with novo 0.10.0.  In that
